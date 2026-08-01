@@ -1,0 +1,13 @@
+# výsledky měření
+vysledky/
+*.sfdump
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# arduino
+build/
+*.elf
+*.uf2

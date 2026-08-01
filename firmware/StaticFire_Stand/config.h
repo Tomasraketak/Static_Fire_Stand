@@ -1,0 +1,61 @@
+// =====================================================================
+//  Static Fire Stand - build time configuration
+//  Everything you are likely to change lives in this one file.
+// =====================================================================
+#pragma once
+
+// ---------------------------------------------------------------------
+//  PIN MAP  (Raspberry Pi Pico 2 W)
+// ---------------------------------------------------------------------
+#define PIN_HX711_DT   2    // HX711 DOUT
+#define PIN_HX711_SCK  3    // HX711 PD_SCK
+#define PIN_BTN        6    // physical FIRE button, active HIGH, INPUT_PULLDOWN
+#define PIN_RBF       11    // Remove-Before-Flight key, HIGH = key inserted = SAFE
+#define PIN_IGNITION  21    // gate of the ignition MOSFET (needs 10k gate pulldown!)
+#define PIN_LED       22    // SK6812 / WS2812 status pixel
+#define PIN_CONT      28    // igniter continuity sense, HIGH = igniter present
+
+// ---------------------------------------------------------------------
+//  SEQUENCE TIMING
+// ---------------------------------------------------------------------
+#define COUNTDOWN_MS      15000UL   // armed -> T0
+#define PREROLL_MS         3000UL   // baseline recorded before T0 (negative times)
+#define RECORDING_MS      20000UL   // recorded after T0
+#define IGNITION_MS        3000UL   // how long the pyro channel is energised
+#define IGNITION_MAX_MS    5000UL   // hard ceiling, enforced independently
+
+// ---------------------------------------------------------------------
+//  SAFETY
+// ---------------------------------------------------------------------
+#define REQUIRE_CONTINUITY_TO_ARM  1   // refuse to arm without igniter continuity
+#define ABORT_ON_CONT_LOSS         1   // abort countdown if continuity disappears
+#define BTN_HOLD_MS              750UL // physical button must be held this long
+#define WDT_TIMEOUT_MS           4000  // hardware watchdog
+#define MAX_FAILED_CODES            5  // web lockout after N wrong codes
+#define LOCKOUT_MS              60000UL
+
+// ---------------------------------------------------------------------
+//  LOAD CELL
+// ---------------------------------------------------------------------
+#define HX711_GAIN             128     // 128 or 64 (ch A), 32 (ch B)
+#define HX711_TIMEOUT_US    500000UL   // no conversion in this long => sensor fault
+#define TARE_SAMPLES              32
+
+// ---------------------------------------------------------------------
+//  NETWORK
+// ---------------------------------------------------------------------
+#define AP_SSID     "SpaceCarrots_Stand"
+#define AP_PASSWORD "thrust123"          // >= 8 chars. CHANGE THIS.
+#define SECRET_CODE "31415"              // arming code typed in the web UI
+
+// ---------------------------------------------------------------------
+//  FLASH DATA LOG
+//  The log lives in raw flash directly below the LittleFS area, so a
+//  reset in the middle of a burn can never corrupt a filesystem.
+// ---------------------------------------------------------------------
+#define LOG_SLOTS          6            // number of burns kept on the device
+#define LOG_SLOT_BYTES     (64u * 1024u)
+#define LOG_JOURNAL_BYTES  (2u * 4096u) // two sectors, A/B rotated
+
+#define FW_VERSION "2.0.0"
+#define BAUD_RATE  115200
