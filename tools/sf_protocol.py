@@ -1,32 +1,35 @@
 """
-Stažení a dekódování dat ze stendu Static Fire Stand.
+Downloading and decoding data from the Static Fire Stand.
 
-Tento modul řeší jen přenos a rozbalení binárního formátu.
-Veškerá analýza je v sf_analysis.py, kreslení v sf_report.py.
+This module only handles transport and unpacking of the binary format.
+All the maths lives in sf_analysis.py, all the drawing in sf_report.py.
 
-Formát na drátě (příkaz 'p'):
+Wire format (serial command 'p'):
 
     #BEGIN SFDUMP v2
     #INFO {...json...}
     #SLOT 0 pages=137
-    <base64 řádek = jedna 256B stránka>
+    <base64 line = one 256 B page>
     ...
     #ENDSLOT 0
     #END SFDUMP
 
-Každá stránka nese vlastní CRC32, takže poškozený řádek se zahodí
-a zbytek zážehu zůstane použitelný.
+Every page carries its own CRC32, so a corrupted line is dropped and the
+rest of the burn stays usable.
 """
 from __future__ import annotations
 
 import base64
 import binascii
 import json
+import os
 import re
 import struct
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -37,13 +40,13 @@ MAGIC_HEADER = 0x31484653  # "SFH1"
 MAGIC_DATA = 0x31504653    # "SFP1"
 MAGIC_FOOTER = 0x31464653  # "SFF1"
 
-# bity příznaků u vzorku
+# per-sample flag bits
 SF_PYRO = 0x01
 SF_CONT = 0x02
 SF_RBF = 0x04
 SF_SAT = 0x08
 
-# bity příznaků u stránky
+# per-page flag bits
 PF_RESUME = 0x01
 PF_GAP = 0x02
 
@@ -64,7 +67,7 @@ def _crc_ok(page: bytes, crc_offset: int) -> bool:
 
 
 # ---------------------------------------------------------------------
-#  Datové třídy
+#  Data classes
 # ---------------------------------------------------------------------
 @dataclass
 class BurnQuality:
@@ -82,19 +85,19 @@ class BurnQuality:
     def problems(self) -> list[str]:
         p = []
         if self.pages_bad_crc:
-            p.append(f"{self.pages_bad_crc} stránek s vadným CRC bylo zahozeno")
+            p.append(f"{self.pages_bad_crc} page(s) failed CRC and were dropped")
         if not self.has_footer:
-            p.append("chybí závěrečná stránka – záznam byl useknut (reset/výpadek napájení)")
+            p.append("no closing page - the record was cut short (reset / power loss)")
         elif not self.clean_finish:
-            p.append("záznam byl uzavřen jako neúplný")
+            p.append("the record was closed as incomplete")
         if self.resume_events:
-            p.append(f"{self.resume_events}× došlo k restartu a navázání záznamu")
+            p.append(f"the stand restarted and resumed recording {self.resume_events}x")
         if self.gap_events:
-            p.append(f"{self.gap_events}× díra v časové ose neznámé délky")
+            p.append(f"{self.gap_events} hole(s) of unknown length in the timeline")
         if self.saturated_samples:
-            p.append(f"{self.saturated_samples} vzorků v saturaci ADC – tenzometr je přetížený")
+            p.append(f"{self.saturated_samples} samples hit the ADC rail - load cell overloaded")
         if self.nonmonotonic_samples:
-            p.append(f"{self.nonmonotonic_samples} vzorků mimo časové pořadí")
+            p.append(f"{self.nonmonotonic_samples} samples arrived out of time order")
         return p
 
 
@@ -126,10 +129,10 @@ class Burn:
 
 
 # ---------------------------------------------------------------------
-#  Dekódování stránek
+#  Page decoding
 # ---------------------------------------------------------------------
 def decode_slot(pages: list[bytes], slot: int) -> Burn | None:
-    """Poskládá jeden zážeh z posbíraných stránek."""
+    """Reassemble one burn from the pages collected for a slot."""
     burn = Burn(slot=slot)
     q = burn.quality
     rows_t: list[np.ndarray] = []
@@ -153,7 +156,7 @@ def decode_slot(pages: list[bytes], slot: int) -> Burn | None:
             burn.burn_id = burn_id
             burn.boot_count = boot
             burn.fw_version = f"{(fwv >> 16) & 0xFF}.{(fwv >> 8) & 0xFF}.{fwv & 0xFF}"
-            burn.cal_counts_per_n = cal if cal not in (0.0,) else 1.0
+            burn.cal_counts_per_n = cal if cal != 0.0 else 1.0
             burn.tare_offset = tare
             burn.preroll_ms = preroll
             burn.recording_ms = recording
@@ -227,7 +230,7 @@ def decode_slot(pages: list[bytes], slot: int) -> Burn | None:
 
 
 # ---------------------------------------------------------------------
-#  Parsování textového výpisu
+#  Parsing the text dump
 # ---------------------------------------------------------------------
 def parse_dump(text: str) -> tuple[dict, list[Burn]]:
     info: dict = {}
@@ -269,17 +272,17 @@ def parse_dump(text: str) -> tuple[dict, list[Burn]]:
 
 
 # ---------------------------------------------------------------------
-#  Import starých dat (firmware V0, CSV přes sériovou linku)
+#  Importing old data (V0 firmware, CSV over the serial line)
 # ---------------------------------------------------------------------
-def load_legacy_csv(path: str | "Path", burn_id: int = 0) -> Burn:
-    """Načte CSV z původního firmwaru: Time(ms);Thrust(N);Pyro_Active.
+def load_legacy_csv(path: str | Path, burn_id: int = 0) -> Burn:
+    """Read a CSV produced by the original firmware.
 
-    Zvládne obě varianty oddělovačů – českou (`;` a desetinná čárka)
-    i anglickou (`,` a tečka). Tah je v těchto souborech už přepočtený
-    na newtony, surová hodnota z ADC v nich není.
+    Columns: Time(ms), Thrust(N), Pyro_Active. Handles both the Czech
+    flavour (`;` with a decimal comma) and the plain one (`,` with a
+    decimal point). Thrust in those files is already in newtons; the raw
+    ADC counts are not recorded, so recalibration is not possible.
     """
     import io
-    import os
 
     with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
         text = fh.read()
@@ -293,7 +296,7 @@ def load_legacy_csv(path: str | "Path", burn_id: int = 0) -> Burn:
     col_f = next((c for c in df.columns if c.lower().startswith("thrust")), None)
     col_p = next((c for c in df.columns if c.lower().startswith("pyro")), None)
     if col_t is None or col_f is None:
-        raise ValueError(f"{path}: chybí sloupce Time(ms) a Thrust(N)")
+        raise ValueError(f"{path}: missing the Time(ms) and Thrust(N) columns")
 
     t_ms = pd.to_numeric(df[col_t], errors="coerce")
     thrust = pd.to_numeric(df[col_f], errors="coerce")
@@ -306,7 +309,7 @@ def load_legacy_csv(path: str | "Path", burn_id: int = 0) -> Burn:
     t_ms, thrust, pyro = t_ms[order], thrust[order], pyro[order]
 
     burn = Burn(slot=-1, burn_id=burn_id, cal_counts_per_n=1.0, tare_offset=0,
-                fw_version="V0 (import CSV)")
+                fw_version="V0 (CSV import)")
     burn.df = pd.DataFrame({
         "t": t_ms / 1000.0,
         "t_ms": t_ms,
@@ -321,39 +324,49 @@ def load_legacy_csv(path: str | "Path", burn_id: int = 0) -> Burn:
     q.has_footer = True
     q.clean_finish = True
     if burn.burn_id == 0:
-        stem = os.path.basename(str(path))
-        m = re.search(r"(\d+)", stem)
+        m = re.search(r"(\d+)", os.path.basename(str(path)))
         burn.burn_id = int(m.group(1)) if m else 0
     return burn
 
 
 # ---------------------------------------------------------------------
-#  Sériová komunikace
+#  Serial communication
 # ---------------------------------------------------------------------
-def find_port() -> str | None:
-    """Najde Pico podle USB VID (0x2E8A = Raspberry Pi)."""
+def list_ports() -> list[tuple[str, str]]:
+    """All serial ports as (device, description), Pico first."""
     try:
-        from serial.tools import list_ports
+        from serial.tools import list_ports as lp
     except ImportError:
-        return None
-    cands = list(list_ports.comports())
-    for p in cands:
-        if p.vid == 0x2E8A:
-            return p.device
-    for p in cands:
-        if "ACM" in p.device or "usbmodem" in p.device:
-            return p.device
-    return cands[0].device if cands else None
+        return []
+    out = []
+    for p in lp.comports():
+        pico = (p.vid == 0x2E8A)
+        label = f"{p.description}{'  [Raspberry Pi Pico]' if pico else ''}"
+        out.append((p.device, label, pico))
+    out.sort(key=lambda r: (not r[2], r[0]))
+    return [(d, la) for d, la, _ in out]
+
+
+def find_port() -> str | None:
+    """Pick the Pico automatically by its USB vendor id (0x2E8A)."""
+    ports = list_ports()
+    for dev, label in ports:
+        if "Raspberry Pi Pico" in label:
+            return dev
+    for dev, _ in ports:
+        if "ACM" in dev or "usbmodem" in dev:
+            return dev
+    return ports[0][0] if ports else None
 
 
 class Stand:
-    """Tenká obálka nad sériovou linkou stendu."""
+    """Thin wrapper around the stand's serial console."""
 
     def __init__(self, port: str, baud: int = 115200, timeout: float = 3.0):
-        import serial  # importuje se až tady, aby analýza offline nepotřebovala pyserial
+        import serial  # imported lazily so offline analysis needs no pyserial
         self.ser = serial.Serial(port, baud, timeout=timeout)
         self.port = port
-        time.sleep(2.0)          # USB CDC se po otevření chvíli ustaluje
+        time.sleep(2.0)          # USB CDC needs a moment to settle
         self.ser.reset_input_buffer()
 
     def close(self) -> None:
@@ -382,21 +395,17 @@ class Stand:
             if not raw:
                 if time.time() - t0 > overall_timeout:
                     break
-                if buf:            # ticho po datech = konec
+                if buf:            # silence after data means we are done
                     break
                 continue
-            line = raw.decode("utf-8", errors="replace")
-            buf.append(line)
+            buf.append(raw.decode("utf-8", errors="replace"))
             if progress and time.time() - last_report > 0.5:
                 last_report = time.time()
-                sys.stdout.write(f"\r  přeneseno {len(buf)} řádků…")
-                sys.stdout.flush()
-            if sentinel in line:
+                print(f"  {len(buf)} lines received...")
+            if sentinel in buf[-1]:
                 break
             if time.time() - t0 > overall_timeout:
                 break
-        if progress:
-            sys.stdout.write("\r" + " " * 40 + "\r")
         return "".join(buf)
 
     def info(self) -> dict:
@@ -413,6 +422,7 @@ class Stand:
         return {}
 
     def download(self, slot: int | None = None, retries: int = 2) -> str:
+        text = ""
         for attempt in range(retries + 1):
             self.ser.reset_input_buffer()
             self.command("p" if slot is None else f"p {slot}")
@@ -420,7 +430,7 @@ class Stand:
             if "#BEGIN SFDUMP" in text and "#END SFDUMP" in text:
                 return text
             if attempt < retries:
-                print(f"  neúplný přenos, opakuji ({attempt + 1}/{retries})…")
+                print(f"  incomplete transfer, retrying ({attempt + 1}/{retries})...")
                 time.sleep(1.0)
         return text
 
@@ -435,3 +445,12 @@ class Stand:
     def calibrate_grams(self, grams: float) -> None:
         self.command(f"calg {grams}")
         time.sleep(3.0)
+
+    def drain(self, seconds: float = 1.5) -> str:
+        """Collect whatever the stand printed, e.g. after a command."""
+        out, deadline = [], time.time() + seconds
+        while time.time() < deadline:
+            line = self.ser.readline()
+            if line:
+                out.append(line.decode("utf-8", errors="replace"))
+        return "".join(out)

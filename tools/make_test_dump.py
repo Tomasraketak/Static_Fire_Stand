@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Generátor syntetického výpisu pro testování analýzy bez připojeného stendu.
+Synthetic dump generator, for trying the analysis without a stand.
 
-Vyrobí přesně ten formát, který posílá firmware (příkaz 'p'), včetně CRC,
-takže se dá otestovat celý řetězec:
+It emits exactly the format the firmware sends for the 'p' command,
+CRCs included, so the whole chain can be exercised:
 
     python make_test_dump.py test.txt
-    python static_fire.py --ze-souboru test.txt
+    python static_fire.py --from-file test.txt
 
-Volitelně umí simulovat výpadek napájení uprostřed zážehu (--vypadek),
-tedy chybějící závěrečnou stránku a díru v časové ose.
+It can also simulate a power cut mid-burn (--cut), which produces a
+record with no closing page and a truncated timeline - handy for
+checking that the analysis says so instead of inventing numbers.
 """
 from __future__ import annotations
 
@@ -23,11 +24,13 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sf_protocol import (MAGIC_DATA, MAGIC_FOOTER, MAGIC_HEADER, PAGE_SIZE,  # noqa: E402
-                         SAMPLES_PER_PAGE, SF_CONT, SF_PYRO)
+from sf_protocol import (MAGIC_DATA, MAGIC_FOOTER, MAGIC_HEADER,  # noqa: E402
+                         PAGE_SIZE, SAMPLES_PER_PAGE, SF_CONT, SF_PYRO)
 
-CAL = 250.0        # counts na newton
-TARE = -123456     # klidový offset ADC
+CAL = 250.0        # ADC counts per newton
+TARE = -123456     # resting ADC offset
+PREROLL_S = 3.0
+RECORD_S = 10.0    # matches RECORDING_MS in the firmware config
 
 
 def _finish(page: bytearray, crc_off: int) -> bytes:
@@ -42,15 +45,15 @@ def header_page(burn_id: int) -> bytes:
     struct.pack_into("<5Ifi5I4I", p, 0,
                      MAGIC_HEADER, burn_id, 0, 7, (2 << 16),
                      CAL, TARE,
-                     3000, 20000, 3000, 15000, 0,
+                     int(PREROLL_S * 1000), int(RECORD_S * 1000), 3000, 15000, 0,
                      0, 0, 0, 0)
     return _finish(p, 8)
 
 
-def data_page(burn_id: int, idx: int, samples, flags_page: int = 0) -> bytes:
+def data_page(burn_id: int, idx: int, samples, page_flags: int = 0) -> bytes:
     p = bytearray(PAGE_SIZE)
     struct.pack_into("<IIHHII", p, 0, MAGIC_DATA, burn_id, idx, len(samples),
-                     flags_page, 0)
+                     page_flags, 0)
     for i, (t_us, raw, fl) in enumerate(samples):
         packed = (int(raw) & 0x00FFFFFF) | (int(fl) << 24)
         struct.pack_into("<iI", p, 20 + i * 8, int(t_us), packed)
@@ -68,7 +71,7 @@ def footer_page(burn_id: int, n_pages: int, n_samples: int, t_last: int,
 
 
 def thrust_curve(t: np.ndarray, delay: float, peak: float, burn: float) -> np.ndarray:
-    """Progresivní křivka s ostrým náběhem a exponenciálním doběhem."""
+    """A progressive curve: sharp rise, rounded top, exponential tail."""
     y = np.zeros_like(t)
     m = t >= delay
     x = (t[m] - delay) / burn
@@ -82,26 +85,25 @@ def thrust_curve(t: np.ndarray, delay: float, peak: float, burn: float) -> np.nd
 
 
 def build(burn_id: int, delay: float, peak: float, burn: float,
-          prop_g: float, rate: float, cut_at: float | None) -> list[bytes]:
-    preroll, record = 3.0, 20.0
-    n = int((preroll + record) * rate)
-    t = np.linspace(-preroll, record, n)
-    t += np.random.normal(0, 0.0004, n)          # jitter vzorkování
+          fuel_g: float, rate: float, cut_at: float | None) -> list[bytes]:
+    n = int((PREROLL_S + RECORD_S) * rate)
+    t = np.linspace(-PREROLL_S, RECORD_S, n)
+    t += np.random.normal(0, 0.0004, n)          # sampling jitter
     t = np.sort(t)
 
     thrust = thrust_curve(t, delay, peak, burn)
 
-    # úbytek hmoty: klidová hodnota klesá úměrně spálenému impulsu
+    # mass loss: the resting reading drops in step with delivered impulse
     cum = np.cumsum(np.maximum(thrust, 0))
     frac = cum / cum[-1] if cum[-1] > 0 else np.zeros_like(cum)
-    baseline = 12.0 - (prop_g / 1000.0 * 9.80665) * frac
+    baseline = 12.0 - (fuel_g / 1000.0 * 9.80665) * frac
 
     signal = baseline + thrust + np.random.normal(0, 0.035, n)
     raw = (signal * CAL + TARE).astype(np.int64)
 
     pyro = (t >= 0) & (t < 3.0)
     flags = np.where(pyro, SF_PYRO | SF_CONT, SF_CONT).astype(np.int64)
-    flags[t >= 3.0] = 0                            # palník po zážehu přerušený
+    flags[t >= 3.0] = 0                          # igniter burnt through
 
     if cut_at is not None:
         keep = t < cut_at
@@ -123,12 +125,12 @@ def build(burn_id: int, delay: float, peak: float, burn: float,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Vyrobí testovací SFDUMP výpis")
+    ap = argparse.ArgumentParser(description="Build a synthetic SFDUMP file")
     ap.add_argument("out", nargs="?", default="test_dump.txt")
-    ap.add_argument("--pocet", type=int, default=2, help="kolik zážehů vyrobit")
-    ap.add_argument("--rate", type=float, default=80.0)
-    ap.add_argument("--vypadek", action="store_true",
-                    help="useknout druhý zážeh uprostřed hoření")
+    ap.add_argument("--count", type=int, default=2, help="how many burns to fake")
+    ap.add_argument("--rate", type=float, default=80.0, help="sample rate in Hz")
+    ap.add_argument("--cut", action="store_true",
+                    help="cut the second burn off mid-flight, as a power loss would")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
@@ -136,26 +138,25 @@ def main() -> int:
     lines = ["#BEGIN SFDUMP v2",
              '#INFO {"fw":"2.0.0","boots":7,"resumes":0,"burns":%d,"slots":6,'
              '"pages_per_slot":256,"samples_per_page":29,"cal_counts_per_n":%.6f,'
-             '"tare":%d,"log_ok":1,"log_err":"","preroll_ms":3000,'
-             '"recording_ms":20000,"ignition_ms":3000,"countdown_ms":15000,"state":1}'
-             % (args.pocet, CAL, TARE)]
+             '"tare":%d,"log_ok":1,"log_err":"","preroll_ms":%d,'
+             '"recording_ms":%d,"ignition_ms":3000,"countdown_ms":15000,"state":1}'
+             % (args.count, CAL, TARE, int(PREROLL_S * 1000), int(RECORD_S * 1000))]
 
-    for i in range(args.pocet):
-        cut = 1.9 if (args.vypadek and i == 1) else None
+    for i in range(args.count):
         pages = build(burn_id=i + 1,
                       delay=0.180 + 0.05 * i,
                       peak=180.0 - 15.0 * i,
                       burn=1.6 + 0.2 * i,
-                      prop_g=42.0 - 3.0 * i,
+                      fuel_g=42.0 - 3.0 * i,
                       rate=args.rate,
-                      cut_at=cut)
+                      cut_at=1.9 if (args.cut and i == 1) else None)
         lines.append(f"#SLOT {i} pages={len(pages)}")
         lines += [base64.b64encode(p).decode() for p in pages]
         lines.append(f"#ENDSLOT {i}")
 
     lines.append("#END SFDUMP")
     Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"Zapsáno: {args.out} ({len(lines)} řádků)")
+    print(f"Written: {args.out} ({len(lines)} lines)")
     return 0
 
 

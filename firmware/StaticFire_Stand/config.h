@@ -20,7 +20,15 @@
 // ---------------------------------------------------------------------
 #define COUNTDOWN_MS      15000UL   // armed -> T0
 #define PREROLL_MS         3000UL   // baseline recorded before T0 (negative times)
-#define RECORDING_MS      20000UL   // recorded after T0
+
+// Sized for a motor that burns at most 4 s. The window has to cover the
+// ignition delay as well, not just the burn: a real measurement on this
+// stand showed the motor lighting 1.7 s after the command, i.e. 0.7 s
+// after the igniter had already been cut. 10 s leaves room for a ~2 s
+// delay, a 4 s burn and the tail, with margin to spare. Raise it if you
+// ever fire something longer - a slot holds ~92 s at 80 SPS.
+#define RECORDING_MS      10000UL   // recorded after T0
+
 #define IGNITION_MS        3000UL   // how long the pyro channel is energised
 #define IGNITION_MAX_MS    5000UL   // hard ceiling, enforced independently
 

@@ -1,266 +1,403 @@
 # Static Fire Stand
 
-Zkušební stend pro statické zážehy raketových motorů na tuhé palivo.
-Řídicí jednotka je **Raspberry Pi Pico 2 W**, tah se měří tenzometrem
-přes **HX711**, zápal obstarává MOSFET spínaný z pinu 21.
+Test stand for static firing of solid rocket motors. The controller is a
+**Raspberry Pi Pico 2 W**, thrust is measured with a load cell through an
+**HX711**, and ignition is switched by a MOSFET on GP21.
 
-Repozitář obsahuje dvě části:
-
-| Adresář | Co to je |
+| Folder | What it is |
 |---|---|
-| `firmware/StaticFire_Stand/` | firmware pro Pico 2 W (Arduino / arduino-pico) |
-| `tools/` | stahování dat z stendu, analýza, grafy, export do Excelu |
+| `firmware/StaticFire_Stand/` | firmware for the Pico 2 W (Arduino / arduino-pico) |
+| `tools/` | download, analysis, charts, Excel export |
+| `docs/` | on-flash and on-wire data formats |
+
+If you just want to fire a motor, jump to
+[**4. Operating tutorial**](#4-operating-tutorial). If you want to know
+why the recorder is built the way it is, start at section 1.
 
 ---
 
-## 1. Co se změnilo oproti první verzi
+## 1. What changed from the first version
 
-### Záznam dat odolný proti výpadku napájení
+### Recording that survives a power cut
 
-Původní verze psala CSV přes `LittleFS` a `f.printf()`. To má dvě vady,
-kvůli kterým se dá o zážeh přijít:
+The original wrote CSV through `LittleFS` and `f.printf()`. Two things
+about that will lose you a burn:
 
-* text se hromadí v RAM bufferu a na flash se dostane až při `f.close()`
-  – **reset uprostřed hoření = prázdný soubor**,
-* zápis do souborového systému uprostřed hoření může při výpadku
-  poškodit adresář a vzít s sebou i starší zážehy.
+* the text sits in a RAM buffer until `f.close()`, so **a reset mid-burn
+  leaves an empty file**,
+* writing to a filesystem during the burn opens a window where a power
+  cut can damage the directory and take older burns with it.
 
-Nová verze nepoužívá při hoření souborový systém vůbec:
+The new firmware does not touch the filesystem during a burn at all:
 
-* data jdou do **vyhrazené oblasti syrové flash** hned pod oblastí LittleFS,
-* každá **256bajtová stránka** má vlastní magii, index, počet vzorků a **CRC32**,
-* slot pro další zážeh se **maže dopředu**, když stend stojí; při hoření
-  se tedy jen programují stránky (~400 µs), nikdy se nemaže sektor (~50 ms),
-* stav (který slot je živý, kolik zážehů proběhlo, kalibrace) drží
-  **A/B žurnál** ve dvou sektorech; při rotaci je vždy aspoň jeden platný.
+* samples go to a **dedicated raw-flash region** just below the LittleFS
+  area,
+* every **256-byte page** carries a magic number, page index, sample
+  count and a **CRC32**,
+* the slot for the next burn is **erased in advance** while the stand is
+  idle, so during the burn only page programming happens (~400 µs), never
+  a sector erase (~50 ms),
+* an **A/B journal** in two sectors holds the coarse state (live slot,
+  burn count, calibration); during rotation at least one copy is always
+  valid.
 
-**Nejhorší možná ztráta při výpadku je jedna stránka, tedy 29 vzorků
-(≈ 360 ms při 80 SPS).** Všechno starší už na flash bezpečně leží.
+**The worst a power cut can cost you is one page: 29 samples, about
+360 ms at 80 SPS.** Everything older is already safely on flash.
 
-### Navázání záznamu po resetu
+### Resuming after a reset
 
-Když žurnál po startu říká, že zážeh běžel, firmware:
+If the journal says a burn was live when the stand booted, the firmware:
 
-1. **nechá pyro kanál vypnutý** – nevíme, jestli motor už nehoří,
-   a znovu pouštět proud do palníku hořícího motoru se nedělá,
-2. dohledá poslední neporušenou stránku ve slotu,
-3. **naváže záznam** ve zbytku okna a označí první stránku příznakem
-   „mezera neznámé délky“,
-4. analytický skript to pak vypíše jako upozornění, ne jako tichou chybu.
+1. **leaves the pyro channel off** — we do not know whether the motor is
+   already burning, and pushing current into the igniter of a burning
+   motor is not something to do automatically,
+2. finds the last intact page in the slot,
+3. **resumes recording** for the rest of the window and marks the first
+   new page as "gap of unknown length",
+4. the analysis then reports that as a warning rather than hiding it.
 
-### Bezpečnost
+### Safety
 
-* `PIN_IGNITION` se sráží na LOW jako **úplně první** operace v `setup()`,
-  ještě před `pinMode()`, aby pin při startu neproblikl.
-* Jediná funkce `pyroSet()` smí sepnout gate a sama znovu kontroluje
-  stav, RBF klíč i časové okno – nezávisle na tom, co si myslí volající.
-* **Nezávislý tvrdý limit** `IGNITION_MAX_MS`: i kdyby se hlavní podmínka
-  přeskočila, gate nemůže zůstat sepnutý déle.
-* Hlídací pes (watchdog) 4 s.
-* Přerušení odpočtu: zasunutí RBF, tlačítko, tlačítko ABORT ve webu,
-  ztráta kontinuity palníku, výpadek tenzometru.
-* Fyzické tlačítko musí být **podrženo** 750 ms, jedno ťuknutí nestačí.
-* Webový kód se porovnává v konstantním čase a po 5 chybách je minuta blokace.
-* Odpočet se nedá spustit bez kontinuity palníku (`REQUIRE_CONTINUITY_TO_ARM`).
+* `PIN_IGNITION` is driven LOW as the **very first** thing in `setup()`,
+  before `pinMode()`, so the pin cannot glitch high at boot.
+* One function, `pyroSet()`, is allowed to drive the gate, and it
+  re-checks state, the RBF key and the time window itself — regardless of
+  what the caller believes.
+* An **independent hard cut-off** at `IGNITION_MAX_MS`: even if the main
+  condition were somehow skipped, the gate cannot stay live longer.
+* 4 s hardware watchdog.
+* Countdown aborts on: RBF key inserted, button, ABORT in the web UI,
+  loss of igniter continuity, load cell failure.
+* The physical button must be **held** for 750 ms; a tap does nothing.
+* The web code is compared in constant time, with a one-minute lockout
+  after 5 wrong attempts.
+* The countdown will not start without igniter continuity.
 
-> **Hardware, který si musíš ohlídat sám:** gate MOSFETu potřebuje
-> **pulldown 10 kΩ na GND**. Při resetu se GPIO přepne na vstup a bez
-> pulldownu zůstane gate plovoucí – to je jediný stav, který firmware
-> ošetřit nedokáže.
+> **One thing the firmware cannot cover:** the MOSFET gate needs a
+> **10 kΩ pulldown to GND**. On reset the GPIO reverts to an input and
+> the gate floats — that state is only reachable by hardware.
 
-### Měření
+### Measurement
 
-* Vlastní neblokující ovladač HX711 místo knihovny: hlásí poruchu
-  senzoru, umožňuje časovat vzorek s přesností na desítky µs a nikdy
-  se nezasekne, když čip přestane odpovídat.
-* Ukládá se **surová hodnota ADC**, ne přepočtený newton. Kalibrace
-  i tára jsou v hlavičce každého zážehu, takže se dají **přepočítat
-  zpětně**, když se ukáže, že kalibrace byla mimo.
-* **3 s předzáznamu** před povelem (dřív 5 vzorků, tj. ~50 ms).
-  Z toho se počítá klidová hodnota a šum – bez nich není odkud brát
-  práh detekce zapálení ani hmotnost paliva.
-* Okno záznamu 20 s (dřív 5 s). Reálné měření ukázalo zpoždění
-  zapálení 1,7 s, takže 5 s bylo těsně.
+* Own non-blocking HX711 driver instead of the stock library: it reports
+  sensor failure, timestamps each conversion to tens of microseconds, and
+  never hangs when the chip stops answering.
+* **Raw ADC counts** are stored, not converted newtons. Calibration and
+  tare live in each burn's header, so thrust can be **recomputed later**
+  if the calibration turns out to have been wrong.
+* **3 s of pre-roll** before the command (the original captured 5
+  samples, about 50 ms). The baseline and its noise come from there, and
+  without them there is nothing to derive the ignition detection
+  threshold or the propellant mass from.
+* The record window is 10 s. That covers a 4 s burn plus a couple of
+  seconds of ignition delay plus the tail — the real measurement below
+  showed a 1.7 s delay, which made the original 5 s window tight.
 
-### Web
+### Web UI
 
-Živý graf tahu, odpočet, stav skladu, tlačítko ABORT, TARE, hlášení
-příčiny posledního přerušení. Jádro 1 (web) **nikdy nesahá na flash
-ani na pyro** – umí jen vznést požadavek, který jádro 0 ověří proti
-fyzickým pojistkám.
+Live thrust plot, countdown, storage status, ABORT and TARE buttons, and
+the reason the last sequence was aborted. Core 1 (the web server)
+**never touches flash or the igniter** — it can only raise a request that
+core 0 validates against the physical interlocks.
 
 ---
 
-## 2. Zapojení
+## 2. Wiring
 
-| Pin Pico | Funkce | Poznámka |
+| Pico pin | Function | Note |
 |---|---|---|
 | GP2 | HX711 DT | |
 | GP3 | HX711 SCK | |
-| GP6 | tlačítko FIRE | k 3V3, `INPUT_PULLDOWN` |
-| GP11 | RBF klíč | HIGH = zasunuto = bezpečno |
-| GP21 | gate MOSFETu | **nutný pulldown 10 kΩ na GND** |
-| GP22 | SK6812 / WS2812 | stavová dioda |
-| GP28 | kontinuita palníku | HIGH = palník připojen |
+| GP6 | FIRE button | to 3V3, `INPUT_PULLDOWN` |
+| GP11 | RBF key | HIGH = inserted = safe |
+| GP21 | MOSFET gate | **10 kΩ pulldown to GND required** |
+| GP22 | SK6812 / WS2812 | status pixel |
+| GP28 | igniter continuity | HIGH = igniter connected |
 
-Napájení 2S LiPo. Pyro okruh měj galvanicky oddělený od logiky nebo
-aspoň s vlastním předřadným odporem – proud palníkem nesmí procházet
-zemí měřicí části, jinak se to projeví na křivce tahu.
+Powered from a 2S LiPo.
 
-**RATE pin HX711 spoj na VCC**, jinak čip běží na 10 SPS a z křivky
-tahu zbude pár bodů.
+Keep the pyro circuit isolated from the logic, or at least give it its
+own supply path — igniter current running through the measurement ground
+will show up on your thrust curve.
 
----
+**Tie the HX711 RATE pin to VCC.** Left floating it runs at 10 SPS and
+your thrust curve will be a handful of dots.
 
-## 3. Firmware
+### Status pixel
 
-Nahraj přes Arduino IDE s [arduino-pico](https://github.com/earlephilhower/arduino-pico)
-(deska *Raspberry Pi Pico 2 W*). Potřebné knihovny: `Adafruit NeoPixel`.
-`WiFi`, `WebServer`, `LittleFS` jsou součástí jádra.
-
-Ve `Flash Size` nech nějaký prostor pro souborový systém, nebo klidně
-0 – log si bere prostor pod oblastí LittleFS a při kolizi se sám vypne
-a ohlásí to (`log_err` v `i`).
-
-Konfigurace je celá v `firmware/StaticFire_Stand/config.h`:
-časování sekvence, piny, SSID, heslo, kód pro odpal, počet slotů.
-
-**Změň `AP_PASSWORD` a `SECRET_CODE` před prvním ostrým zážehem.**
-
-### Sériové příkazy (115200 Bd)
-
-```
-?           nápověda
-i           stav zařízení jako JSON
-t           vynulování tenzometru
-cal <N>     kalibrace známou silou v newtonech
-calg <g>    kalibrace známým závažím v gramech
-l           výpis slotů
-p           výpis všech zážehů (base64 stránky)
-p <slot>    výpis jednoho slotu
-d           smazání všech dat
-abort       přerušení odpočtu
-s           jedno měření tahu
-```
+| Colour | Meaning |
+|---|---|
+| blue | idle, RBF key inserted, safe |
+| yellow | idle, key removed, continuity OK — armed |
+| amber | idle, key removed, **no igniter continuity** |
+| blinking red | countdown, blink rate increases as T0 approaches |
+| solid red | recording, pyro window |
+| cyan | dumping data over serial |
+| blinking magenta | fault — no storage or no load cell |
 
 ---
 
-## 4. Vyhodnocení dat
+## 3. Installing
 
-```bash
+### Firmware
+
+1. Install [arduino-pico](https://github.com/earlephilhower/arduino-pico)
+   in the Arduino IDE board manager.
+2. Board: **Raspberry Pi Pico 2 W**.
+3. Library needed: **Adafruit NeoPixel**. `WiFi`, `WebServer` and
+   `LittleFS` come with the core.
+4. Open `firmware/StaticFire_Stand/StaticFire_Stand.ino` and upload.
+
+All the settings you are likely to change are in `config.h`: pin map,
+sequence timing, SSID, password, arming code, number of slots.
+
+**Change `AP_PASSWORD` and `SECRET_CODE` before the first live firing.**
+
+### Python tools
+
+```
 pip install -r tools/requirements.txt
 ```
 
-```bash
-# stáhne vše ze stendu, vyhodnotí, uloží grafy + CSV + XLSX
-python tools/static_fire.py
-
-# konkrétní port
-python tools/static_fire.py --port COM5
-
-# známá navážka paliva – Isp pak sedí, nespoléhá se na posun váhy
-python tools/static_fire.py --palivo 42.5
-
-# offline vyhodnocení dřív staženého výpisu
-python tools/static_fire.py --ze-souboru vysledky/20260716_135131/vypis_*.txt
-
-# stará data z firmwaru V0
-python tools/static_fire.py --stare-csv zazeh_1_*.csv
-
-# správa stendu
-python tools/static_fire.py --info
-python tools/static_fire.py --tara
-python tools/static_fire.py --kalibrace 500     # závaží 500 g
-python tools/static_fire.py --smazat
-```
-
-Každé stažení nejdřív **uloží syrový výpis** do souboru a teprve pak
-ho zpracuje. Když se analýza něčím zadrhne, data už jsou v bezpečí
-na disku a dají se pustit znovu přes `--ze-souboru`.
-
-### Co skript spočítá
-
-**Časování zapálení** (od povelu, tedy od sepnutí pyro kanálu):
-
-* zpoždění do prvního pohybu – práh je `max(6σ šumu, 1 % špičky)`
-  a musí ho překročit tři vzorky po sobě, aby jeden zákmit neposunul výsledek
-* časy dosažení 5 / 10 / 25 / 50 / 75 / 90 / 95 / 100 % špičky (i pro doběh)
-* náběh 10 → 90 %, maximální strmost náběhu v N/s
-* kdy se rozpojil pyro kanál
-
-**Křivka tahu:**
-
-* špičkový tah a jeho čas, poměr špička/průměr
-* doba hoření (T0 → pokles pod 5 %) i action time (5 % → 5 %)
-* průměrný tah počítaný z action time i od T0
-* těžiště křivky a čas, kdy motor odevzdal polovinu impulsu
-
-**Impuls a účinnost:**
-
-* celkový impuls lichoběžníkovou integrací
-* **korekce úbytku hmoty**: jak palivo ubývá, klesá i klidová hodnota
-  váhy. Posun se interpoluje váženě podle už spáleného impulsu, ne
-  lineárně v čase – palivo neubývá rovnoměrně
-* hmotnost paliva z posunu klidové hodnoty, nebo zadaná přes `--palivo`
-* Isp, efektivní výtoková rychlost
-* třída motoru podle NAR/TRA a označení typu `H169`
-
-**Kvalita měření** – vzorkovací frekvence, mezery, šum a drift baseline,
-saturace ADC, zahozené stránky s vadným CRC, chybějící závěrečná stránka,
-navázání po restartu. Když něco nesedí, skript to napíše místo toho,
-aby vydal hezké, ale nesmyslné číslo.
-
-### Výstupy
-
-```
-vysledky/20260716_135131/
-├── vypis_20260716_135131.txt      syrový výpis ze stendu (záloha)
-├── zazeh_001_data.csv             surová data, český Excel
-├── zazeh_001_data.xlsx            list Souhrn + Data + Náběh, s grafem
-├── zazeh_001_souhrn.csv           jen souhrnná tabulka
-├── zazeh_001_grafy.png            5 grafů na jednom listu
-├── prehled_zazehu.csv             řádek na zážeh, na porovnání šarží
-└── porovnani_zazehu.png           křivky všech zážehů přes sebe
-```
-
-CSV mají oddělovač `;`, desetinnou **čárku**, BOM a na prvním řádku
-`sep=;`. Otevřou se dvojklikem v českém Excelu správně, bez importního
-průvodce a bez toho, aby si Excel spletl čísla s datem.
-
-XLSX ukládá čísla jako čísla, takže se zobrazí podle lokálního
-nastavení automaticky, a obsahuje nativní Excelový graf.
+That pulls in numpy, pandas, matplotlib, openpyxl and pyserial.
 
 ---
 
-## 5. Poznámky z reálného měření
+## 4. Operating tutorial
 
-Kontrolní vyhodnocení zážehu z 16. 7. 2026 (starý firmware, import
-přes `--stare-csv`) ukázalo tři věci, které stojí za zapamatování:
+### 4.1 First time only: calibrate
 
-* **Motor se zapálil 1,715 s po povelu** – tedy 718 ms poté, co
-  firmware už odpojil palník. Zápalná směs dohořívala sama. Proto je
-  v nové verzi okno záznamu 20 s, ne 5 s.
-* **Klidová hodnota před zážehem 0,23 N, po zážehu −2,26 N.** Váha
-  přešla do záporných čísel, takže stend po zážehu nesedí stejně jako
-  před ním. Než budeš věřit hmotnosti paliva dopočtené z tohoto posunu,
-  ověř ji navážkou a předej ji přes `--palivo`.
-* **Mezera 107 ms těsně u T0** je od `while (millis() < planned_ignition_time)`
-  ve staré verzi. Nová verze v tom okně normálně vzorkuje.
+Calibration turns ADC counts into newtons. Do it once per mechanical
+build, and again any time you change the mount.
+
+1. Connect the stand to the computer over USB.
+2. Open `tools/static_fire.py` in **Python IDLE** and press **F5**.
+3. Choose **5) Zero (tare) the load cell** with the stand empty (motor
+   mount in place, no motor).
+4. Put a known weight where the motor will push. Use something in the
+   region of the thrust you expect — a 100 g weight calibrating a 250 N
+   motor gives a poor factor.
+5. Choose **6) Calibrate with a known weight** and enter the weight in
+   grams.
+6. Choose **4) Show stand status** and check that `cal_counts_per_n` is
+   no longer 1.0.
+
+The factor is stored on the Pico and survives power cycles. It is also
+written into every burn's header.
+
+### 4.2 Before every firing
+
+Run through this at the bench, before anything is live:
+
+- [ ] **RBF key inserted.** Status pixel is blue.
+- [ ] Battery charged. A brownout mid-burn now costs you one page instead
+      of the whole record, but it still ends the test.
+- [ ] Motor bolted into the mount, nozzle pointing somewhere safe with
+      nothing in the exhaust path.
+- [ ] Nothing resting on the motor, no cables pulling on it — anything
+      touching the motor shows up as thrust.
+- [ ] Igniter installed in the motor but **not yet connected**.
+- [ ] Load cell zeroed for this session (menu option 5).
+
+### 4.3 Firing
+
+1. **Power up the stand.** The pixel goes blue (safe).
+2. **Connect to the WiFi access point** `SpaceCarrots_Stand` from a phone
+   or laptop, then open `http://192.168.42.1/` in a browser. The page
+   shows live thrust, continuity, RBF state and the storage status.
+3. **Connect the igniter leads** to the pyro terminals. This is the last
+   thing anyone does at the stand.
+4. **Walk to the firing position.** Take the RBF key with you.
+5. **Check continuity on the web page.** It must read `OK`. If it reads
+   `OPEN` the igniter is not connected properly — this is exactly why you
+   check from a distance, not at the stand.
+6. **Check the storage line.** It should say how many slots are free. If
+   it says `DISABLED`, stop: the burn will not be recorded.
+7. **Remove the RBF key.** The pixel turns yellow, the web page shows
+   `OUT / ARMED`, and the FIRE button becomes clickable.
+8. **Confirm everyone is clear.** Call it out loud.
+9. **Type the code and press START COUNTDOWN.** Confirm the dialog.
+10. **The countdown runs for 15 s.** The pixel blinks red, faster as T0
+    approaches, and the web page counts down `T-14.3 s`. The recorder
+    opens 3 s before T0 and starts banking baseline samples.
+11. **T0.** The igniter is energised for 3 s or until the hard cut-off.
+    Recording continues for 10 s.
+12. **The pixel goes back to blue/yellow** and the web page returns to
+    `IDLE`. The burn is on flash.
+
+**To abort at any point during the countdown:** press ABORT on the web
+page, or insert the RBF key, or hold the physical button. Any of the
+three stops the sequence and returns the stand to idle. Losing igniter
+continuity aborts it automatically.
+
+### 4.4 If the motor does not light
+
+1. **Wait at least 60 seconds.** Hangfires exist. This is not optional.
+2. Walk to the stand and **insert the RBF key first**, before touching
+   anything else.
+3. Disconnect the igniter leads.
+4. Only then inspect the motor.
+
+The stand will have recorded the whole attempt, which is useful: the
+thrust curve tells you whether nothing happened at all or whether the
+motor produced a little pressure and stopped.
+
+### 4.5 After firing: getting the data
+
+1. Insert the RBF key, disconnect the pyro leads, let the motor cool.
+2. Bring the Pico to the computer and connect it over USB.
+3. Open `tools/static_fire.py` in **IDLE** and press **F5**.
+4. Choose **1) Download data from the stand and analyse it**.
+5. Pick the serial port from the list (the Pico is marked and usually
+   first, so pressing Enter is normally right).
+6. Enter the **propellant mass in grams** if you weighed the motor before
+   and after. This makes Isp trustworthy. Leaving it empty falls back to
+   estimating it from how much the resting reading drops, which only
+   works if the stand settles back to rest after the burn.
+7. The script downloads, **saves the raw dump to disk first**, then
+   analyses every burn and writes the charts and spreadsheets.
+8. Answer `y` to open the results folder.
+
+Results land in `results/YYYYMMDD_HHMMSS/` next to the tools folder.
+
+**Erase the stand's memory only after you have checked the data.** It
+holds 6 burns and overwrites the oldest automatically, so there is
+rarely a reason to erase at all.
+
+### 4.6 Reading the results
+
+Each burn produces:
+
+```
+results/20260716_135131/
+├── raw_dump.txt                 what the stand sent (keep this)
+├── burn_001_data.csv            raw samples, Excel-ready
+├── burn_001_data.xlsx           Summary + Data + Rise sheets, with a chart
+├── burn_001_summary.csv         just the summary table
+├── burn_001_charts.png          five charts on one sheet
+├── all_burns_overview.csv       one row per burn, for comparing batches
+└── burn_comparison.png          every curve overlaid
+```
+
+The chart sheet has five panels:
+
+| Panel | What to look at |
+|---|---|
+| Thrust curve | the whole burn, with the pyro window, action time and the mass-loss correction line |
+| Ignition close-up | the delay from command to first motion, and the rise thresholds |
+| Cumulative impulse | how the impulse accumulates; a straight ramp means a neutral grain |
+| Thrust build-up | percent of peak against time, in milliseconds |
+| Record quality | interval between samples — flat is good, spikes are dropouts |
+
+**Read the warnings.** When something is off — record cut short, load
+cell saturated, mass loss unmeasurable, motor still burning at the end —
+the script says so instead of printing a confident wrong number.
+
+### 4.7 Reading old data
+
+CSV files from the original firmware still work:
+
+- IDLE: menu option **3) Analyse a CSV from the old V0 firmware**
+- command line: `python static_fire.py --legacy-csv burn_1.csv`
+
+Those files hold converted newtons rather than raw counts, so they
+cannot be recalibrated — but every timing and impulse figure works.
+
+### 4.8 Trying the tools without hardware
+
+Menu option **8) Demo** generates a realistic fake dataset and runs the
+whole pipeline on it. Useful for learning what the outputs look like
+before you have a motor on the stand.
 
 ---
 
-## 6. Bezpečnostní minimum
+## 5. Serial commands
 
-Tohle je zařízení, které schválně zapaluje raketový motor.
+The tools do all of this for you, but the console is there at 115200 baud
+if you want it:
 
-1. RBF klíč zasunutý vždy, když je někdo blíž než na bezpečnou vzdálenost.
-2. Palník se připojuje jako **poslední** krok, po odchodu od stendu.
-3. Kontinuita se kontroluje z bezpečné vzdálenosti přes web, ne u stendu.
-4. Po nezahoření **počkej aspoň 60 s**, teprve pak k stendu jdi, a jako
-   první zasuň RBF.
-5. Motor miř do prostoru, kde výtoku nic nestojí v cestě, a počítej
-   s tím, že se komora může roztrhnout.
-6. Mimo dosah dětí, hasicí přístroj po ruce, a nikdy sám.
+```
+?           help
+i           device status as JSON
+t           zero the load cell
+cal <N>     calibrate with a known force in newtons
+calg <g>    calibrate with a known mass in grams
+l           list slots
+p           dump every stored burn
+p <slot>    dump one slot
+d           erase all data
+abort       abort the running countdown
+s           one thrust reading
+```
 
-Software může jen zabránit tomu, aby proud tekl do palníku v nesprávný
-okamžik. Zbytek je na tobě.
+---
+
+## 6. What the analysis computes
+
+**Ignition timing**, all measured from the fire command:
+
+* delay to first motion — the threshold is `max(6σ of noise, 1 % of
+  peak)` and three consecutive samples must clear it, so a single spike
+  cannot move the result
+* times to 5 / 10 / 25 / 50 / 75 / 90 / 95 / 100 % of peak, for both the
+  rise and the decay
+* rise time 10 → 90 %, steepest rise in N/s
+* when the pyro channel opened
+
+**Thrust curve:**
+
+* peak thrust and when it occurred, peak-to-average ratio
+* burn time (T0 → decay through 5 %) and action time (5 % → 5 %)
+* average thrust over the action time and from T0
+* thrust centroid and the time at which half the impulse was delivered
+
+**Impulse and efficiency:**
+
+* total impulse by trapezoidal integration
+* **mass-loss correction**: as propellant leaves, the resting reading
+  drops. The shift is interpolated against the impulse already delivered
+  rather than linearly in time, because propellant does not leave at a
+  constant rate
+* propellant mass from the shift in resting reading, or entered manually
+* Isp and effective exhaust velocity
+* NAR/TRA letter class and a designation like `H169`
+
+**Measurement quality** — sample rate, gaps, baseline noise and drift,
+ADC saturation, pages dropped on CRC, missing closing page, resumes after
+a restart.
+
+---
+
+## 7. Notes from a real measurement
+
+A burn from 16 July 2026, recorded with the old firmware and re-analysed
+through `--legacy-csv`, showed three things worth remembering:
+
+* **The motor lit 1.715 s after the command** — 718 ms *after* the
+  firmware had already cut the igniter. The pyrogen was burning on its
+  own by then. Do not assume the motor lights when you press the button.
+* **Resting reading was +0.23 N before and −2.26 N after.** The stand
+  does not sit the same way afterwards. Before trusting a propellant mass
+  derived from that shift, weigh the motor and pass the number in.
+* **A 107 ms gap right at T0**, from the old `while (millis() <
+  planned_ignition_time)` spin. The new firmware samples through that
+  window.
+
+---
+
+## 8. Safety minimum
+
+This is a device whose whole purpose is to set fire to a rocket motor.
+
+1. RBF key inserted whenever anyone is closer than the safe distance.
+2. The igniter is connected **last**, on the way out.
+3. Continuity is checked from the firing position over WiFi, never at the
+   stand.
+4. After a failure to ignite, **wait at least 60 s**, then approach and
+   insert the RBF key before anything else.
+5. Point the nozzle where the exhaust has somewhere to go, and assume the
+   casing can burst.
+6. Fire extinguisher within reach, no children nearby, and never alone.
+
+Software can only stop current reaching the igniter at the wrong moment.
+The rest is on you.

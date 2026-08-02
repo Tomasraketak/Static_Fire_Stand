@@ -1,6 +1,7 @@
-# výsledky měření
-vysledky/
+# measurement output
+results/
 *.sfdump
+raw_dump*.txt
 
 # python
 .venv/
