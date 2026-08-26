@@ -7,7 +7,7 @@ Test stand for static firing of solid rocket motors. The controller is a
 | Folder | What it is |
 |---|---|
 | `firmware/StaticFire_Stand/` | firmware for the Pico 2 W (Arduino / arduino-pico) |
-| `tools/` | download, analysis, charts, Excel export |
+| `tools/` | download, analysis, charts, Excel export — GUI (`sf_gui.py`) and console (`static_fire.py`) front ends |
 | `docs/` | on-flash and on-wire data formats |
 
 If you just want to fire a motor, jump to
@@ -159,11 +159,49 @@ sequence timing, SSID, password, arming code, number of slots.
 pip install -r tools/requirements.txt
 ```
 
-That pulls in numpy, pandas, matplotlib, openpyxl and pyserial.
+That pulls in numpy, pandas, matplotlib, openpyxl and pyserial. On Linux,
+the graphical tool also needs tkinter, which is a separate OS package
+there (already bundled with Python on Windows and macOS):
+
+```
+sudo apt install python3-tk        # Debian / Ubuntu
+sudo dnf install python3-tkinter   # Fedora
+```
 
 ---
 
 ## 4. Operating tutorial
+
+### 4.0 Two ways to run the tools
+
+**Graphical (recommended for most people).** Double-click
+`tools/sf_gui.py`, or run:
+
+```
+python tools/sf_gui.py
+```
+
+This opens a window with two tabs:
+
+* **Extract & Analyse** — download data from the stand, analyse a raw
+  dump saved earlier, import an old V0-firmware CSV, or run the
+  no-hardware demo. Pick the serial port from the dropdown, optionally
+  type the propellant mass in grams, choose whether to generate charts,
+  and press the button for what you want to do. Progress and any
+  warnings appear in the **Log** pane at the bottom, and an **Open
+  results folder** button lights up once a run finishes.
+* **Stand Tools** — status, tare (zero the load cell) and calibration,
+  the same operations available from the console menu below.
+
+Nothing here changes what the tools compute — the graphical window calls
+the exact same download and analysis code as the console script, it just
+saves you from typing menu numbers.
+
+**Console / IDLE (works everywhere, no extra package needed).** Open
+`tools/static_fire.py` in Python IDLE and press **F5** for a text menu,
+or run it from a terminal — see `python tools/static_fire.py --help` for
+every flag. The rest of this tutorial shows the console menu numbers;
+in the graphical tool, use the equivalently named button instead.
 
 ### 4.1 First time only: calibrate
 
@@ -171,16 +209,18 @@ Calibration turns ADC counts into newtons. Do it once per mechanical
 build, and again any time you change the mount.
 
 1. Connect the stand to the computer over USB.
-2. Open `tools/static_fire.py` in **Python IDLE** and press **F5**.
-3. Choose **5) Zero (tare) the load cell** with the stand empty (motor
-   mount in place, no motor).
+2. Open `tools/static_fire.py` in **Python IDLE** and press **F5**, or
+   open `tools/sf_gui.py` and switch to the **Stand Tools** tab.
+3. Choose **5) Zero (tare) the load cell** (console) or **Zero (tare) the
+   load cell** (GUI) with the stand empty (motor mount in place, no
+   motor).
 4. Put a known weight where the motor will push. Use something in the
    region of the thrust you expect — a 100 g weight calibrating a 250 N
    motor gives a poor factor.
-5. Choose **6) Calibrate with a known weight** and enter the weight in
-   grams.
-6. Choose **4) Show stand status** and check that `cal_counts_per_n` is
-   no longer 1.0.
+5. Choose **6) Calibrate with a known weight** (console) or **Calibrate
+   with a known weight...** (GUI) and enter the weight in grams.
+6. Choose **4) Show stand status** (console) or **Show stand status**
+   (GUI) and check that `cal_counts_per_n` is no longer 1.0.
 
 The factor is stored on the Pico and survives power cycles. It is also
 written into every burn's header.
@@ -246,19 +286,27 @@ motor produced a little pressure and stopped.
 
 1. Insert the RBF key, disconnect the pyro leads, let the motor cool.
 2. Bring the Pico to the computer and connect it over USB.
-3. Open `tools/static_fire.py` in **IDLE** and press **F5**.
-4. Choose **1) Download data from the stand and analyse it**.
-5. Pick the serial port from the list (the Pico is marked and usually
-   first, so pressing Enter is normally right).
-6. Enter the **propellant mass in grams** if you weighed the motor before
-   and after. This makes Isp trustworthy. Leaving it empty falls back to
-   estimating it from how much the resting reading drops, which only
+3. Open `tools/sf_gui.py` (or `tools/static_fire.py` in IDLE and press
+   **F5** for the console menu instead).
+4. **GUI:** on the **Extract & Analyse** tab, pick the serial port from
+   the dropdown (the Pico is usually auto-selected), optionally type the
+   **propellant mass in grams**, and press **Download from stand &
+   analyse**.
+   **Console:** choose **1) Download data from the stand and analyse
+   it**, pick the port from the list, then enter the propellant mass
+   when asked.
+5. The propellant mass makes Isp trustworthy. Leaving it empty falls back
+   to estimating it from how much the resting reading drops, which only
    works if the stand settles back to rest after the burn.
-7. The script downloads, **saves the raw dump to disk first**, then
-   analyses every burn and writes the charts and spreadsheets.
-8. Answer `y` to open the results folder.
+6. The tool downloads, **saves the raw dump to disk first**, then
+   analyses every burn and writes the charts and spreadsheets. Progress
+   shows in the GUI's log pane or the console window.
+7. **GUI:** click **Open results folder** when it lights up, or answer
+   the "open the folder now?" prompt.
+   **Console:** answer `y` to open the results folder.
 
-Results land in `results/YYYYMMDD_HHMMSS/` next to the tools folder.
+Results land in `results/YYYYMMDD_HHMMSS/` next to the tools folder
+(or wherever you set as the output folder in the GUI).
 
 **Erase the stand's memory only after you have checked the data.** It
 holds 6 burns and overwrites the oldest automatically, so there is
@@ -297,6 +345,8 @@ the script says so instead of printing a confident wrong number.
 
 CSV files from the original firmware still work:
 
+- GUI: **Extract & Analyse** tab → **Import a legacy V0 CSV...** (pick
+  one or several files at once)
 - IDLE: menu option **3) Analyse a CSV from the old V0 firmware**
 - command line: `python static_fire.py --legacy-csv burn_1.csv`
 
@@ -305,9 +355,10 @@ cannot be recalibrated — but every timing and impulse figure works.
 
 ### 4.8 Trying the tools without hardware
 
-Menu option **8) Demo** generates a realistic fake dataset and runs the
-whole pipeline on it. Useful for learning what the outputs look like
-before you have a motor on the stand.
+GUI: **Extract & Analyse** tab → **Run demo (no hardware needed)**.
+Console: menu option **8) Demo**. Both generate a realistic fake dataset
+and run the whole pipeline on it. Useful for learning what the outputs
+look like before you have a motor on the stand.
 
 ---
 
