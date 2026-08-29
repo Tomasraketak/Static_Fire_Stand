@@ -67,11 +67,18 @@ If the journal says a burn was live when the stand booted, the firmware:
   condition were somehow skipped, the gate cannot stay live longer.
 * 4 s hardware watchdog.
 * Countdown aborts on: RBF key inserted, button, ABORT in the web UI,
-  loss of igniter continuity, load cell failure.
+  load cell failure.
 * The physical button must be **held** for 750 ms; a tap does nothing.
 * The web code is compared in constant time, with a one-minute lockout
   after 5 wrong attempts.
-* The countdown will not start without igniter continuity.
+
+Igniter continuity is measured and shown on the status pixel, the web UI
+and `i`/`--info`, but by default it is **informational only** — it does
+not block arming or abort a countdown (`REQUIRE_CONTINUITY_TO_ARM` and
+`ABORT_ON_CONT_LOSS` in `config.h`, both `0`). Set either back to `1` to
+have the firmware enforce it again; the check itself is still there, just
+gated off. **Reading the continuity indicator before firing is still the
+operator's job either way** — see the [firing checklist](#44-firing).
 
 > **One thing the firmware cannot cover:** the MOSFET gate needs a
 > **10 kΩ pulldown to GND**. On reset the GPIO reverts to an input and
@@ -101,10 +108,11 @@ sequence was aborted. Core 1 (the web server) **never touches flash or
 the igniter** — it can only raise a request that core 0 validates against
 the physical interlocks, so the START COUNTDOWN button rejects the same
 conditions the physical interlocks do (busy, RBF key in, storage or load
-cell fault, no igniter continuity) with an on-screen reason rather than a
-false "countdown started". The live plot auto-scales to whatever is
-currently on screen (min *and* max, not just peak), with a small minimum
-span so idle noise does not get blown up into a huge trace.
+cell fault, and igniter continuity too if `REQUIRE_CONTINUITY_TO_ARM` is
+turned back on) with an on-screen reason rather than a false "countdown
+started". The live plot auto-scales to whatever is currently on screen
+(min *and* max, not just peak), with a small minimum span so idle noise
+does not get blown up into a huge trace.
 
 ---
 
@@ -309,7 +317,9 @@ Run through this at the bench, before anything is live:
 4. **Walk to the firing position.** Take the RBF key with you.
 5. **Check continuity on the web page.** It must read `OK`. If it reads
    `OPEN` the igniter is not connected properly — this is exactly why you
-   check from a distance, not at the stand.
+   check from a distance, not at the stand. By default the firmware does
+   not block firing on a bad reading here (`REQUIRE_CONTINUITY_TO_ARM` is
+   `0`) — this step is the actual safeguard, not a formality.
 6. **Check the storage line.** It should say how many slots are free. If
    it says `DISABLED`, stop: the burn will not be recorded.
 7. **Remove the RBF key.** The pixel turns yellow, the web page shows
@@ -327,7 +337,9 @@ Run through this at the bench, before anything is live:
 **To abort at any point during the countdown:** press ABORT on the web
 page, or insert the RBF key, or hold the physical button. Any of the
 three stops the sequence and returns the stand to idle. Losing igniter
-continuity aborts it automatically.
+continuity does **not** abort it automatically by default (set
+`ABORT_ON_CONT_LOSS 1` in `config.h` to have it do so) — watch the
+continuity reading yourself and abort by hand if it drops.
 
 ### 4.5 If the motor does not light
 

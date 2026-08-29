@@ -40,8 +40,8 @@
 // ---------------------------------------------------------------------
 //  SAFETY
 // ---------------------------------------------------------------------
-#define REQUIRE_CONTINUITY_TO_ARM  1   // refuse to arm without igniter continuity
-#define ABORT_ON_CONT_LOSS         1   // abort countdown if continuity disappears
+#define REQUIRE_CONTINUITY_TO_ARM  0   // refuse to arm without igniter continuity
+#define ABORT_ON_CONT_LOSS         0   // abort countdown if continuity disappears
 #define BTN_HOLD_MS              750UL // physical button must be held this long
 #define WDT_TIMEOUT_MS           4000  // hardware watchdog
 #define MAX_FAILED_CODES            5  // web lockout after N wrong codes
