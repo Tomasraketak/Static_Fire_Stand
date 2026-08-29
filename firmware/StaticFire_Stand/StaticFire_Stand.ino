@@ -907,6 +907,12 @@ static void handleFire() {
   if (tlm_rbf)              { server.send(409, "text/plain", "remove the RBF key"); return; }
   if (!tlm_log_ok)          { server.send(409, "text/plain", "storage fault"); return; }
   if (!tlm_hx_ok)           { server.send(409, "text/plain", "load cell fault"); return; }
+#if REQUIRE_CONTINUITY_TO_ARM
+  // Mirrors interlocksOk() on core 0, which silently refuses to start the
+  // countdown without continuity. Without this check the web UI would
+  // report "countdown started" even though nothing actually happens.
+  if (!tlm_cont)            { server.send(409, "text/plain", "no igniter continuity"); return; }
+#endif
   req_fire = 1;
   server.send(200, "text/plain", "countdown started");
 }

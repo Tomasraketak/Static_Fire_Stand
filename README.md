@@ -99,7 +99,10 @@ Live thrust plot, countdown, storage status, ABORT and TARE buttons, a
 settings card to change the igniter on-time, and the reason the last
 sequence was aborted. Core 1 (the web server) **never touches flash or
 the igniter** — it can only raise a request that core 0 validates against
-the physical interlocks. The live plot auto-scales to whatever is
+the physical interlocks, so the START COUNTDOWN button rejects the same
+conditions the physical interlocks do (busy, RBF key in, storage or load
+cell fault, no igniter continuity) with an on-screen reason rather than a
+false "countdown started". The live plot auto-scales to whatever is
 currently on screen (min *and* max, not just peak), with a small minimum
 span so idle noise does not get blown up into a huge trace.
 
@@ -212,6 +215,12 @@ This opens a window with two tabs:
 Nothing here changes what the tools compute — the graphical window calls
 the exact same download and analysis code as the console script, it just
 saves you from typing menu numbers.
+
+The window opens in a dark theme by default. Working outdoors, a dark UI
+on a laptop screen mostly turns into a mirror in direct sun — click the
+**☀ Sunlight mode** button top-right (or View → Sunlight theme) to switch
+to a high-contrast light theme instead; the button toggles back with
+**🌙 Dark mode**.
 
 **Console / IDLE (works everywhere, no extra package needed).** Open
 `tools/static_fire.py` in Python IDLE and press **F5** for a text menu,

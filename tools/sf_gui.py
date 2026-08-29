@@ -40,15 +40,30 @@ from static_fire import download, new_output_dir, open_folder, run_analysis  # n
 APP_TITLE = "Static Fire Stand"
 FW_IGNITION_CEILING_MS = 5000
 
-# Same dark palette as the stand's own web UI, so the two look related.
-PALETTE = dict(
-    bg="#0d0d0d", card="#1a1a19", card2="#141413", ink="#f4f4f2", mut="#9b9a94",
-    line="#2c2c2a", ok="#0ca30c", warn="#fab219", crit="#d03b3b", acc="#3987e5",
-    acc_active="#5aa0f0", danger="#a92e2e", danger_active="#c23a3a",
-    entry_bg="#000000", select="#233247",
-)
-MONO = ("Consolas", 9) if sys.platform.startswith("win") else ("Menlo", 9) \
-    if sys.platform == "darwin" else ("Monospace", 9)
+# Two themes: "dark" matches the stand's own web UI for indoor/desk use.
+# "sunlight" is a high-contrast light theme for a laptop screen outdoors -
+# a dark UI mostly turns into a mirror in direct sun, so this instead uses
+# near-black text on a light, low-glare ground with deliberately darkened
+# accent colours (the web UI's amber/green read as washed-out pastel on a
+# bright screen at max brightness).
+PALETTES = {
+    "dark": dict(
+        bg="#0d0d0d", card="#1a1a19", card2="#141413", ink="#f4f4f2", mut="#9b9a94",
+        line="#2c2c2a", ok="#0ca30c", warn="#fab219", crit="#d03b3b", acc="#3987e5",
+        acc_active="#5aa0f0", danger="#a92e2e", danger_active="#c23a3a",
+        entry_bg="#000000", select="#233247",
+    ),
+    "sunlight": dict(
+        bg="#f2f1ec", card="#ffffff", card2="#e4e2d9", ink="#000000", mut="#3a3a36",
+        line="#8a887e", ok="#0a6e0a", warn="#a15c00", crit="#a3241c", acc="#0a4fb0",
+        acc_active="#083c87", danger="#a3241c", danger_active="#7e1c16",
+        entry_bg="#ffffff", select="#cfe0ff",
+    ),
+}
+DEFAULT_THEME = "dark"
+THEME_LABEL = {"dark": "Dark", "sunlight": "Sunlight"}
+MONO = ("Consolas", 10) if sys.platform.startswith("win") else ("Menlo", 10) \
+    if sys.platform == "darwin" else ("Monospace", 10)
 
 
 # ---------------------------------------------------------------------
@@ -125,6 +140,8 @@ class App(tk.Tk):
         self.busy = False
         self.debug_var = tk.BooleanVar(value=False)
         self.last_outdir: Path | None = None
+        self.theme = DEFAULT_THEME
+        self.palette = PALETTES[self.theme]
 
         self._build_style()
         self._build_menubar()
@@ -135,7 +152,7 @@ class App(tk.Tk):
 
     # -- look and feel -----------------------------------------------------
     def _build_style(self) -> None:
-        p = PALETTE
+        p = self.palette
         self.configure(bg=p["bg"])
         style = ttk.Style(self)
         try:
@@ -207,18 +224,61 @@ class App(tk.Tk):
         filem.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="File", menu=filem)
 
+        viewm = tk.Menu(menubar, tearoff=0)
+        self.theme_menu_var = tk.StringVar(value=self.theme)
+        for key in ("dark", "sunlight"):
+            viewm.add_radiobutton(label=f"{THEME_LABEL[key]} theme", value=key,
+                                  variable=self.theme_menu_var,
+                                  command=lambda k=key: self._set_theme(k))
+        menubar.add_cascade(label="View", menu=viewm)
+
         helpm = tk.Menu(menubar, tearoff=0)
         helpm.add_command(label="Open README", command=self._open_readme)
         helpm.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=helpm)
         self.config(menu=menubar)
 
+    def _theme_btn_text(self) -> str:
+        return "☀ Sunlight mode" if self.theme == "dark" else "🌙 Dark mode"
+
+    def _toggle_theme(self) -> None:
+        self._set_theme("sunlight" if self.theme == "dark" else "dark")
+
+    def _set_theme(self, name: str) -> None:
+        if name == self.theme or name not in PALETTES:
+            return
+        self.theme = name
+        self.palette = PALETTES[name]
+        self.theme_menu_var.set(name)
+        self._build_style()  # ttk widgets re-render automatically on style change
+        p = self.palette
+        # plain tk widgets (not ttk) need their colours poked by hand
+        self.log.configure(background=p["entry_bg"], foreground=p["ink"],
+                           insertbackground=p["ink"])
+        self.log.tag_configure("err", foreground=p["crit"])
+        self.log.tag_configure("warn", foreground=p["warn"])
+        self.log.tag_configure("ok", foreground=p["ok"])
+        self.log.tag_configure("head", foreground=p["acc"], font=(MONO[0], MONO[1], "bold"))
+        self.status_dot.configure(bg=p["bg"])
+        self.status_dot.itemconfig(self._dot, fill=p["warn"] if self.busy else p["ok"])
+        self.theme_btn.configure(text=self._theme_btn_text())
+        self.status_var.set(f"Switched to the {THEME_LABEL[name]} theme.")
+
     # -- layout --------------------------------------------------------------
     def _build_widgets(self) -> None:
-        p = PALETTE
+        p = self.palette
         header = ttk.Frame(self, padding=(16, 14, 16, 6))
         header.pack(fill="x")
-        ttk.Label(header, text="STATIC FIRE STAND", style="Header.TLabel").pack(anchor="w")
+        title_row = ttk.Frame(header)
+        title_row.pack(fill="x")
+        ttk.Label(title_row, text="STATIC FIRE STAND", style="Header.TLabel").pack(
+            side="left", anchor="w")
+        self.theme_btn = ttk.Button(title_row, text=self._theme_btn_text(),
+                                    style="Small.TButton", command=self._toggle_theme)
+        self.theme_btn.pack(side="right", anchor="e")
+        Tooltip(self.theme_btn, "Switch between the dark theme and a high-contrast "
+                                "light theme that stays readable on a laptop screen "
+                                "in direct sunlight.")
         ttk.Label(header, text="Extract, analyse and configure - GUI front end for the tools "
                               "in this folder.", style="SubHeader.TLabel").pack(anchor="w")
 
@@ -525,7 +585,7 @@ class App(tk.Tk):
         self.busy = busy
         for b in self.action_buttons + self.stand_buttons:
             b.configure(state="disabled" if busy else "normal")
-        self.status_dot.itemconfig(self._dot, fill=PALETTE["warn"] if busy else PALETTE["ok"])
+        self.status_dot.itemconfig(self._dot, fill=self.palette["warn"] if busy else self.palette["ok"])
         if busy:
             self.progress.start(12)
             self.status_var.set(message or "Working...")
