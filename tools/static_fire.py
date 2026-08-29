@@ -19,6 +19,8 @@ TWO WAYS TO RUN THIS
    python static_fire.py --info              show stand status
    python static_fire.py --tare              zero the load cell
    python static_fire.py --calibrate 500     calibrate with a 500 g weight
+   python static_fire.py --cal-factor 2291.9275  set the counts/N factor directly
+   python static_fire.py --ignition 300      set the igniter on-time, in ms
    python static_fire.py --erase             wipe the stand's memory
 
 Results go to results/YYYYMMDD_HHMMSS/ next to this script, unless
@@ -37,8 +39,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from sf_analysis import analyze, summary_rows  # noqa: E402
-from sf_protocol import (Stand, find_port, list_ports, load_legacy_csv,  # noqa: E402
-                         parse_dump)
+from sf_protocol import (DEFAULT_CAL_COUNTS_PER_N, DEFAULT_IGNITION_MS,  # noqa: E402
+                         Stand, find_port, list_ports, load_legacy_csv, parse_dump)
 
 
 # =====================================================================
@@ -358,6 +360,46 @@ def menu_calibrate() -> None:
         print(f"  Connection failed: {exc}")
 
 
+def menu_calibrate_manual() -> None:
+    port = choose_port()
+    if not port:
+        return
+    print(f"\n  Type the calibration factor directly, in raw counts per")
+    print(f"  newton, instead of doing a weight calibration. The firmware")
+    print(f"  default is {DEFAULT_CAL_COUNTS_PER_N:g} counts/N.")
+    factor = ask_float(f"\n  Counts per newton [Enter = {DEFAULT_CAL_COUNTS_PER_N:g}]: ",
+                       DEFAULT_CAL_COUNTS_PER_N)
+    if not factor or factor == 0:
+        print("  Cancelled.")
+        return
+    try:
+        with Stand(port) as stand:
+            stand.calibrate_factor(factor)
+            print("   ", stand.drain(2.0).strip())
+    except Exception as exc:
+        print(f"  Connection failed: {exc}")
+
+
+def menu_ignition() -> None:
+    port = choose_port()
+    if not port:
+        return
+    print(f"\n  How long the pyro channel stays energised. The firmware")
+    print(f"  default is {DEFAULT_IGNITION_MS} ms; the hard ceiling is 5000 ms")
+    print(f"  regardless of what is set here.")
+    ms = ask_float(f"\n  Igniter on-time in ms [Enter = {DEFAULT_IGNITION_MS}]: ",
+                   DEFAULT_IGNITION_MS)
+    if not ms or ms <= 0:
+        print("  Cancelled.")
+        return
+    try:
+        with Stand(port) as stand:
+            stand.set_ignition_ms(int(ms))
+            print("   ", stand.drain(2.0).strip())
+    except Exception as exc:
+        print(f"  Connection failed: {exc}")
+
+
 def menu_erase() -> None:
     port = choose_port()
     if not port:
@@ -405,6 +447,8 @@ MENU = [
     ("Show stand status", menu_status),
     ("Zero (tare) the load cell", menu_tare),
     ("Calibrate with a known weight", menu_calibrate),
+    ("Calibrate: enter the counts/N factor directly", menu_calibrate_manual),
+    ("Set the igniter on-time", menu_ignition),
     ("Erase all data on the stand", menu_erase),
     ("Demo: generate fake data and analyse it (no hardware)", menu_demo),
 ]
@@ -463,13 +507,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tare", action="store_true", help="zero the load cell")
     p.add_argument("--calibrate", type=float, metavar="GRAMS",
                    help="calibrate with a known weight, in grams")
+    p.add_argument("--cal-factor", dest="cal_factor", type=float, metavar="COUNTS_PER_N",
+                   help=f"set the calibration factor directly, in raw counts per "
+                       f"newton (firmware default {DEFAULT_CAL_COUNTS_PER_N:g})")
+    p.add_argument("--ignition", type=int, metavar="MS",
+                   help=f"set the igniter on-time in milliseconds "
+                       f"(firmware default {DEFAULT_IGNITION_MS})")
     p.add_argument("--info", action="store_true", help="print stand status and exit")
     return p
 
 
 def cli(args) -> int:
     # --- actions that never touch the analysis path --------------------
-    if args.erase or args.tare or args.calibrate is not None or args.info:
+    if (args.erase or args.tare or args.calibrate is not None or args.cal_factor is not None
+            or args.ignition is not None or args.info):
         port = args.port or find_port()
         if not port:
             print("No serial port found.")
@@ -492,6 +543,12 @@ def cli(args) -> int:
                 print("Load cell zeroed.")
             if args.calibrate is not None:
                 stand.calibrate_grams(args.calibrate)
+                print(stand.drain(2.0).strip())
+            if args.cal_factor is not None:
+                stand.calibrate_factor(args.cal_factor)
+                print(stand.drain(2.0).strip())
+            if args.ignition is not None:
+                stand.set_ignition_ms(args.ignition)
                 print(stand.drain(2.0).strip())
             if args.erase:
                 if input("Erase ALL data on the stand? Type ERASE: ").strip() == "ERASE":

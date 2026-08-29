@@ -29,14 +29,19 @@
 // ever fire something longer - a slot holds ~92 s at 80 SPS.
 #define RECORDING_MS      10000UL   // recorded after T0
 
-#define IGNITION_MS        3000UL   // how long the pyro channel is energised
-#define IGNITION_MAX_MS    5000UL   // hard ceiling, enforced independently
+// How long the pyro channel is energised. This is only the FALLBACK used
+// on a virgin device or if the stored setting is out of range - the value
+// actually used at runtime lives in flash (SfJournal.ignition_ms) and can
+// be changed without reflashing: serial command `ign <ms>`, the web UI's
+// settings card, or the Python GUI / `static_fire.py --ignition <ms>`.
+#define DEFAULT_IGNITION_MS  300UL
+#define IGNITION_MAX_MS     5000UL   // hard ceiling, enforced independently regardless of setting
 
 // ---------------------------------------------------------------------
 //  SAFETY
 // ---------------------------------------------------------------------
-#define REQUIRE_CONTINUITY_TO_ARM  1   // refuse to arm without igniter continuity
-#define ABORT_ON_CONT_LOSS         1   // abort countdown if continuity disappears
+#define REQUIRE_CONTINUITY_TO_ARM  0   // refuse to arm without igniter continuity
+#define ABORT_ON_CONT_LOSS         0   // abort countdown if continuity disappears
 #define BTN_HOLD_MS              750UL // physical button must be held this long
 #define WDT_TIMEOUT_MS           4000  // hardware watchdog
 #define MAX_FAILED_CODES            5  // web lockout after N wrong codes
@@ -49,12 +54,20 @@
 #define HX711_TIMEOUT_US    500000UL   // no conversion in this long => sensor fault
 #define TARE_SAMPLES              32
 
+// Fallback calibration factor (raw ADC counts per newton), used on a
+// virgin device or if the stored value is invalid. This is only a
+// starting point - always calibrate the real stand with a known weight
+// (or type the factor in directly, if you already know it) before
+// trusting the numbers: serial `cal`/`calg`/`calset`, the Python GUI's
+// "Stand Tools" tab, or `static_fire.py --calibrate` / `--cal-factor`.
+#define DEFAULT_CAL_COUNTS_PER_N  2291.9275f
+
 // ---------------------------------------------------------------------
 //  NETWORK
 // ---------------------------------------------------------------------
 #define AP_SSID     "SpaceCarrots_Stand"
 #define AP_PASSWORD "thrust123"          // >= 8 chars. CHANGE THIS.
-#define SECRET_CODE "31415"              // arming code typed in the web UI
+#define SECRET_CODE "31415"              // default arming code typed in the web UI. CHANGE THIS.
 
 // ---------------------------------------------------------------------
 //  FLASH DATA LOG
