@@ -43,11 +43,18 @@ volatile int32_t  tlm_t_ms         = 0;   // countdown remaining, or time since 
 volatile uint32_t tlm_samples      = 0;
 volatile uint32_t tlm_total_burns  = 0;
 volatile uint32_t tlm_free_slots   = 0;
+volatile uint32_t tlm_next_overwrite_id = 0;  // burn id the next recording would overwrite, 0 = none
 volatile uint32_t tlm_log_ok       = 0;
 volatile uint32_t tlm_hx_ok        = 0;
 volatile uint32_t tlm_boot_count   = 0;
 volatile uint32_t tlm_resume_count = 0;
 volatile uint32_t tlm_last_abort   = 0;   // reason code of the last abort
+volatile int32_t  tlm_batt_mV      = -1;  // battery voltage, mV; -1 = not read yet
+
+// True from just before the preroll opens (flash writes start) to just
+// after the burn closes (flash writes stop). Core 1 reads this to stay
+// off the WiFi/HTTP stack for that window - see the comment on loop1().
+volatile uint32_t tlm_recording_active = 0;
 
 // requests raised by core 1 (web) and consumed by core 0
 volatile uint32_t req_fire         = 0;
@@ -200,6 +207,19 @@ static bool serviceLoadCell() {
   return true;
 }
 
+// Battery voltage through the resistive divider on PIN_BATT_ADC. Averaged
+// over a handful of samples and rate limited by the caller - the ADC is
+// shared hardware and a full-speed read every loop() would just add noise
+// and (needlessly) contend with anything else using it.
+static int32_t readBatteryMv() {
+  if (BATT_DIVIDER_RATIO <= 0.0f) return -1;
+  uint32_t sum = 0;
+  const int N = 8;
+  for (int i = 0; i < N; i++) sum += analogRead(PIN_BATT_ADC);
+  float v_adc = (sum / (float)N) / 4095.0f * 3.3f;
+  return (int32_t)(v_adc * BATT_DIVIDER_RATIO * 1000.0f + 0.5f);
+}
+
 // ---------------------------------------------------------------------
 //  Base64 for the serial dump
 // ---------------------------------------------------------------------
@@ -225,22 +245,24 @@ static void printBase64Page(const uint8_t *data) {
 
 static void printInfoJson() {
   Serial.printf("{\"fw\":\"%s\",\"boots\":%lu,\"resumes\":%lu,\"burns\":%lu,"
-                "\"slots\":%lu,\"pages_per_slot\":%lu,\"samples_per_page\":%u,"
+                "\"slots\":%lu,\"free_slots\":%lu,\"pages_per_slot\":%lu,"
+                "\"samples_per_page\":%u,"
                 "\"cal_counts_per_n\":%.6f,\"tare\":%ld,\"log_ok\":%d,\"log_err\":\"%s\","
                 "\"preroll_ms\":%lu,\"recording_ms\":%lu,\"ignition_ms\":%lu,"
-                "\"countdown_ms\":%lu,\"state\":%lu}\n",
+                "\"countdown_ms\":%lu,\"state\":%lu,\"batt_mV\":%ld}\n",
                 FW_VERSION,
                 (unsigned long)flashLog.journal().boot_count,
                 (unsigned long)flashLog.journal().resume_count,
                 (unsigned long)flashLog.journal().total_burns,
                 (unsigned long)flashLog.slotCount(),
+                (unsigned long)tlm_free_slots,
                 (unsigned long)flashLog.pagesPerSlot(),
                 (unsigned)SF_SAMPLES_PER_PAGE,
                 calCountsPerN, (long)tareOffset,
                 flashLog.ok() ? 1 : 0, flashLog.error(),
                 (unsigned long)PREROLL_MS, (unsigned long)RECORDING_MS,
                 (unsigned long)ignitionMs, (unsigned long)COUNTDOWN_MS,
-                (unsigned long)state);
+                (unsigned long)state, (long)tlm_batt_mV);
 }
 
 // Dumps raw 256 byte pages as base64, one line per page. Every page
@@ -393,6 +415,7 @@ static void abortSequence(uint32_t reason) {
   pyroForceOff();
   if (flashLog.recording()) flashLog.endBurn(0, false);
   prerollOpen = false;
+  tlm_recording_active = 0;
   tlm_last_abort = reason;
   Serial.printf("ABORT: %s\n", abortName(reason));
   enterState(ST_IDLE);
@@ -436,6 +459,7 @@ static void openBurnFile() {
 static void closeBurn(bool clean) {
   flashLog.endBurn(pyroOffUs, clean);
   prerollOpen = false;
+  tlm_recording_active = 0;
   flashLog.journal().total_burns = burnId;
   flashLog.commitJournal();
   tlm_total_burns = burnId;
@@ -457,6 +481,10 @@ void setup() {
   pinMode(PIN_BTN,  INPUT_PULLDOWN);
   pinMode(PIN_RBF,  INPUT_PULLDOWN);
   pinMode(PIN_CONT, INPUT_PULLDOWN);
+  if (BATT_DIVIDER_RATIO > 0.0f) {
+    analogReadResolution(12);
+    pinMode(PIN_BATT_ADC, INPUT);
+  }
 
   Serial.begin(BAUD_RATE);
 
@@ -516,6 +544,7 @@ void setup() {
       burnSlot = slot;
       resumedBurn = true;
       prerollOpen = true;
+      tlm_recording_active = 1;
       // micros() restarts at 0, so anchor the timeline to the last
       // surviving sample. The gap of unknown length is flagged in the
       // first page we write, and the host reports it.
@@ -558,9 +587,37 @@ void loop() {
   const bool btn  = (digitalRead(PIN_BTN)  == HIGH);
   tlm_rbf  = rbf ? 1 : 0;
   tlm_cont = cont ? 1 : 0;
-  tlm_free_slots = 0;
-  for (uint32_t s = 0; s < flashLog.slotCount(); s++)
-    if (flashLog.slotIsReady(s)) tlm_free_slots++;
+
+  // "Free" means "never written yet". slotIsReady() tracks something
+  // different (pre-erased so the next countdown does not have to wait on
+  // a sector erase) and only ever has one slot set at a time by design -
+  // counting THAT as "free" made the web UI's storage line flap between
+  // 0 and 1 regardless of how many burns were actually stored. Slots are
+  // a ring buffer of flashLog.slotCount(), so once every slot has been
+  // used at least once there genuinely are 0 free - firing again always
+  // overwrites the oldest stored burn, which tlm_next_overwrite_id below
+  // calls out by burn id so the operator can download it first.
+  uint32_t totalBurns = flashLog.journal().total_burns;
+  uint32_t slotCap     = flashLog.slotCount();
+  tlm_free_slots = (totalBurns < slotCap) ? (slotCap - totalBurns) : 0;
+  tlm_next_overwrite_id = 0;
+  if (tlm_free_slots == 0 && flashLog.ok()) {
+    uint32_t nextSlot = totalBurns % slotCap;
+    if (flashLog.validPages(nextSlot) > 0) {
+      const SfHeaderPage *h = (const SfHeaderPage *)flashLog.pagePtr(nextSlot, 0);
+      if (h->magic == SF_MAGIC_HEADER) tlm_next_overwrite_id = h->burn_id;
+    }
+  }
+
+  // Battery voltage: sampled a few times a second, never inside the
+  // recording window (the ADC read takes tens of microseconds and has no
+  // business competing with load-cell sampling right when it matters).
+  static uint32_t lastBattReadMs = 0;
+  uint32_t nowMs = millis();
+  if (state != ST_RECORDING && nowMs - lastBattReadMs >= 500) {
+    lastBattReadMs = nowMs;
+    tlm_batt_mV = readBatteryMv();
+  }
 
   // physical button: must be held, and only counts when the key is out
   bool btnFire = false;
@@ -657,6 +714,7 @@ void loop() {
       // Open the log PREROLL_MS before T0 and start banking baseline
       // samples with negative timestamps.
       if (!prerollOpen && rem <= (int32_t)PREROLL_MS) {
+        tlm_recording_active = 1;   // keep core 1 off the web server from here on
         t0_us = micros() + (uint32_t)rem * 1000UL;
         openBurnFile();
         if (state != ST_COUNTDOWN) break;   // openBurnFile aborted
@@ -770,6 +828,7 @@ const char html_page[] PROGMEM = R"rawliteral(
   <div class="row"><span>RBF key</span><span class="v" id="rbf">--</span></div>
   <div class="row"><span>Pyro channel</span><span class="v" id="pyro">--</span></div>
   <div class="row"><span>Load cell</span><span class="v" id="hx">--</span></div>
+  <div class="row"><span>Battery</span><span class="v" id="batt">--</span></div>
   <div class="row"><span>Storage</span><span class="v" id="log">--</span></div>
   <div class="row"><span>Samples logged</span><span class="v" id="samples">0</span></div>
   <div class="row"><span>Burns stored</span><span class="v" id="burns">0</span></div>
@@ -820,7 +879,16 @@ function draw(){
 function cls(el,c){el.className='v '+c;}
 async function tick(){
  try{
-  const d=await (await fetch('/api/data')).json();
+  // Core 1 deliberately stops answering HTTP for the ~13 s a burn is
+  // recording (see loop1() in the firmware - it protects the sample
+  // timing). A bounded timeout, and waiting for each request to settle
+  // before firing the next, keeps that gap from queuing up a pile of
+  // stale fetches that would otherwise all land at once when it reopens.
+  const ctrl=new AbortController();
+  const to=setTimeout(()=>ctrl.abort(),1200);
+  let d;
+  try{ d=await (await fetch('/api/data',{signal:ctrl.signal})).json(); }
+  finally{ clearTimeout(to); }
   document.getElementById('thrust').textContent=(d.thrust/1000).toFixed(2);
   hist.push(d.thrust/1000);hist.shift();draw();
   const st=document.getElementById('state');
@@ -833,8 +901,17 @@ async function tick(){
   const r=document.getElementById('rbf');r.textContent=d.rbf?'IN / SAFE':'OUT / ARMED';cls(r,d.rbf?'ok':'warn');
   const p=document.getElementById('pyro');p.textContent=d.pyro?'LIVE':'off';cls(p,d.pyro?'crit':'ok');
   const x=document.getElementById('hx');x.textContent=d.hx?'OK':'FAULT';cls(x,d.hx?'ok':'crit');
+  const b=document.getElementById('batt');
+  if(d.batt_mV>=0){
+   // batt_warn_mV / batt_crit_mV come straight from BATT_WARN_MV /
+   // BATT_CRIT_MV in config.h, so the page always matches the firmware
+   b.textContent=(d.batt_mV/1000).toFixed(2)+' V';
+   cls(b, d.batt_mV<d.batt_crit_mV?'crit':(d.batt_mV<d.batt_warn_mV?'warn':'ok'));
+  } else { b.textContent='n/a'; cls(b,'ok'); }
   const l=document.getElementById('log');
-  l.textContent=d.log?(d.free+' slots free'):'DISABLED';cls(l,d.log?(d.free?'ok':'warn'):'crit');
+  l.textContent=d.log?(d.free+' slots free'+(d.free==0&&d.next_overwrite?
+    (' (next overwrites #'+d.next_overwrite+')'):'')):'DISABLED';
+  cls(l,d.log?(d.free?'ok':'warn'):'crit');
   document.getElementById('samples').textContent=d.samples;
   document.getElementById('burns').textContent=d.burns;
   document.getElementById('abort').textContent=d.abort;
@@ -843,6 +920,7 @@ async function tick(){
   const ii=document.getElementById('ignInput');
   if(document.activeElement!==ii && !ii.value) ii.placeholder=d.ign_ms;
  }catch(e){document.getElementById('state').textContent='LINK LOST';}
+ finally{ setTimeout(tick,150); }
 }
 function msg(t){document.getElementById('msg').textContent=t;
  setTimeout(()=>document.getElementById('msg').textContent='',4000);}
@@ -860,24 +938,28 @@ function setIgnition(){
  if(!ms){msg('enter the on-time in ms');return;}
  post('/api/set_ignition','?code='+encodeURIComponent(c)+'&ms='+encodeURIComponent(ms));
 }
-setInterval(tick,150);tick();
+tick();
 </script></body></html>
 )rawliteral";
 
 static void handleRoot() { server.send_P(200, "text/html", html_page); }
 
 static void handleData() {
-  char json[440];
+  char json[540];
   snprintf(json, sizeof(json),
            "{\"state\":%lu,\"thrust\":%ld,\"raw\":%ld,\"cont\":%d,\"rbf\":%d,\"pyro\":%d,"
-           "\"hx\":%d,\"log\":%d,\"free\":%lu,\"t\":%ld,\"samples\":%lu,\"burns\":%lu,"
-           "\"boots\":%lu,\"resumes\":%lu,\"abort\":\"%s\",\"ign_ms\":%lu}",
+           "\"hx\":%d,\"log\":%d,\"free\":%lu,\"next_overwrite\":%lu,\"t\":%ld,"
+           "\"samples\":%lu,\"burns\":%lu,"
+           "\"boots\":%lu,\"resumes\":%lu,\"abort\":\"%s\",\"ign_ms\":%lu,\"batt_mV\":%ld,"
+           "\"batt_warn_mV\":%d,\"batt_crit_mV\":%d}",
            (unsigned long)tlm_state, (long)tlm_thrust_mN, (long)tlm_raw,
            tlm_cont ? 1 : 0, tlm_rbf ? 1 : 0, tlm_pyro ? 1 : 0,
            tlm_hx_ok ? 1 : 0, tlm_log_ok ? 1 : 0, (unsigned long)tlm_free_slots,
+           (unsigned long)tlm_next_overwrite_id,
            (long)tlm_t_ms, (unsigned long)tlm_samples, (unsigned long)tlm_total_burns,
            (unsigned long)tlm_boot_count, (unsigned long)tlm_resume_count,
-           abortName(tlm_last_abort), (unsigned long)tlm_ignition_ms);
+           abortName(tlm_last_abort), (unsigned long)tlm_ignition_ms, (long)tlm_batt_mV,
+           (int)BATT_WARN_MV, (int)BATT_CRIT_MV);
   server.send(200, "application/json", json);
 }
 
@@ -966,7 +1048,20 @@ void setup1() {
 }
 
 void loop1() {
-  server.handleClient();
+  // Core 1 is parked by core 0 for every flash page write (~3x a second
+  // while recording, via rp2040.idleOtherCore()), and that park request
+  // can only be honoured once core 1 reaches a safe checkpoint. Servicing
+  // an HTTP request runs the lwIP/cyw43 stack, which can sit with
+  // interrupts disabled for a SPI transaction or a slow client for long
+  // enough to make that wait stretch into the hundreds of milliseconds -
+  // exactly the kind of gap the analysis flags as "largest gap between
+  // samples". Recording is short (under 15 s including preroll) and
+  // nothing safety critical needs the web UI mid-burn, so core 1 simply
+  // stays off the network stack for that window instead. The page's own
+  // poll loop already copes with a few missed requests.
+  if (!tlm_recording_active) {
+    server.handleClient();
+  }
   // Core 1 is parked by core 0 during flash writes; nothing here may
   // hold a lock that core 0 needs.
   delay(1);
