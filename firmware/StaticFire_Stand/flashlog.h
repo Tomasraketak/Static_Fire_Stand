@@ -128,7 +128,8 @@ struct SfJournal {
   float    cal_counts_per_n;
   int32_t  tare_offset;
   uint32_t slot_erased_mask;  // bit N set = slot N is erased and ready
-  uint32_t reserved[5];
+  uint32_t ignition_ms;       // igniter on-time, ms (0 = use the firmware default)
+  uint32_t reserved[4];
   uint8_t  pad[SF_PAGE_SIZE - 4 * 16];
 };
 

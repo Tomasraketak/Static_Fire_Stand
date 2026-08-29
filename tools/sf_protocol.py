@@ -56,6 +56,14 @@ _DATA_HDR_FMT = "<IIHHII"
 
 G0 = 9.80665
 
+# Firmware defaults (config.h) - shown as placeholders in the GUI/CLI so the
+# operator can see what "leave it blank" actually means. The stand always
+# reports the value it is really using in its own #INFO / /api/data JSON;
+# these are only the fallback used on a virgin device.
+DEFAULT_CAL_COUNTS_PER_N = 2291.9275
+DEFAULT_IGNITION_MS = 300
+DEFAULT_ARM_CODE = "31415"
+
 
 # ---------------------------------------------------------------------
 #  CRC
@@ -445,6 +453,16 @@ class Stand:
     def calibrate_grams(self, grams: float) -> None:
         self.command(f"calg {grams}")
         time.sleep(3.0)
+
+    def calibrate_factor(self, counts_per_n: float) -> None:
+        """Set the calibration factor directly, bypassing the weight step."""
+        self.command(f"calset {counts_per_n}")
+        time.sleep(1.0)
+
+    def set_ignition_ms(self, ms: int) -> None:
+        """Set how long the pyro channel is energised, in milliseconds."""
+        self.command(f"ign {ms}")
+        time.sleep(1.0)
 
     def drain(self, seconds: float = 1.5) -> str:
         """Collect whatever the stand printed, e.g. after a command."""

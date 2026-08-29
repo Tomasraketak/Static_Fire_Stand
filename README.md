@@ -95,10 +95,13 @@ If the journal says a burn was live when the stand booted, the firmware:
 
 ### Web UI
 
-Live thrust plot, countdown, storage status, ABORT and TARE buttons, and
-the reason the last sequence was aborted. Core 1 (the web server)
-**never touches flash or the igniter** — it can only raise a request that
-core 0 validates against the physical interlocks.
+Live thrust plot, countdown, storage status, ABORT and TARE buttons, a
+settings card to change the igniter on-time, and the reason the last
+sequence was aborted. Core 1 (the web server) **never touches flash or
+the igniter** — it can only raise a request that core 0 validates against
+the physical interlocks. The live plot auto-scales to whatever is
+currently on screen (min *and* max, not just peak), with a small minimum
+span so idle noise does not get blown up into a huge trace.
 
 ---
 
@@ -149,7 +152,20 @@ your thrust curve will be a handful of dots.
 4. Open `firmware/StaticFire_Stand/StaticFire_Stand.ino` and upload.
 
 All the settings you are likely to change are in `config.h`: pin map,
-sequence timing, SSID, password, arming code, number of slots.
+sequence timing, SSID, WiFi password, arming code, number of slots, and
+the fallback calibration factor and igniter on-time. Defaults out of the
+box:
+
+| Setting | Default | Where |
+|---|---|---|
+| Web UI arming code (`SECRET_CODE`) | `31415` | `config.h` (compile time only) |
+| Calibration factor (`DEFAULT_CAL_COUNTS_PER_N`) | `2291.9275` counts/N | `config.h`, changeable live — see [4.1](#41-first-time-only-calibrate) |
+| Igniter on-time (`DEFAULT_IGNITION_MS`) | `300` ms | `config.h`, changeable live — see [4.2](#42-igniter-on-time) |
+
+The calibration factor and igniter on-time can be changed at any time
+without reflashing (serial, the Python GUI, `static_fire.py`, or the web
+UI) — only the WiFi password and the arming code require editing
+`config.h` and re-uploading.
 
 **Change `AP_PASSWORD` and `SECRET_CODE` before the first live firing.**
 
@@ -208,6 +224,12 @@ in the graphical tool, use the equivalently named button instead.
 Calibration turns ADC counts into newtons. Do it once per mechanical
 build, and again any time you change the mount.
 
+The firmware ships with a fallback factor of **2291.9275 counts/N** (set
+in `config.h` as `DEFAULT_CAL_COUNTS_PER_N`) so a virgin device does not
+read exactly 1:1 — but that number is for *this* project's reference load
+cell wiring, not yours. Always calibrate your own stand before trusting
+the numbers.
+
 1. Connect the stand to the computer over USB.
 2. Open `tools/static_fire.py` in **Python IDLE** and press **F5**, or
    open `tools/sf_gui.py` and switch to the **Stand Tools** tab.
@@ -220,12 +242,40 @@ build, and again any time you change the mount.
 5. Choose **6) Calibrate with a known weight** (console) or **Calibrate
    with a known weight...** (GUI) and enter the weight in grams.
 6. Choose **4) Show stand status** (console) or **Show stand status**
-   (GUI) and check that `cal_counts_per_n` is no longer 1.0.
+   (GUI) and check `cal_counts_per_n` looks right for your load cell.
 
 The factor is stored on the Pico and survives power cycles. It is also
 written into every burn's header.
 
-### 4.2 Before every firing
+**Already know the factor?** Skip the weight step and type it in
+directly: console menu **7) Calibrate: enter the counts/N factor
+directly**, GUI **Stand Tools → Calibrate: enter counts/N directly...**,
+`static_fire.py --cal-factor 2291.9275`, or serial command
+`calset <counts_per_n>`.
+
+### 4.2 Igniter on-time
+
+How long the pyro channel is energised — the current pulse into the
+igniter — defaults to **300 ms** (`DEFAULT_IGNITION_MS` in `config.h`).
+That is a starting point for a typical e-match; some igniters need
+longer. The firmware enforces an independent hard ceiling of 5000 ms
+(`IGNITION_MAX_MS`) no matter what this is set to, so a bad value cannot
+hold the gate on indefinitely.
+
+Change it any time the stand is idle, without reflashing:
+
+- **Python GUI:** Stand Tools tab → **Set igniter on-time...**
+- **Console:** menu **8) Set the igniter on-time**
+- **Command line:** `static_fire.py --ignition 300`
+- **Serial:** `ign <ms>`
+- **Web UI:** the settings card at the bottom of the page — enter the
+  value and press **SET**, using the same arming CODE as firing.
+
+The value is stored on the Pico (survives power cycles) and is written
+into every burn's header, so the analysis always knows what was actually
+used regardless of what the default is at the time.
+
+### 4.3 Before every firing
 
 Run through this at the bench, before anything is live:
 
@@ -239,7 +289,7 @@ Run through this at the bench, before anything is live:
 - [ ] Igniter installed in the motor but **not yet connected**.
 - [ ] Load cell zeroed for this session (menu option 5).
 
-### 4.3 Firing
+### 4.4 Firing
 
 1. **Power up the stand.** The pixel goes blue (safe).
 2. **Connect to the WiFi access point** `SpaceCarrots_Stand` from a phone
@@ -270,7 +320,7 @@ page, or insert the RBF key, or hold the physical button. Any of the
 three stops the sequence and returns the stand to idle. Losing igniter
 continuity aborts it automatically.
 
-### 4.4 If the motor does not light
+### 4.5 If the motor does not light
 
 1. **Wait at least 60 seconds.** Hangfires exist. This is not optional.
 2. Walk to the stand and **insert the RBF key first**, before touching
@@ -282,7 +332,7 @@ The stand will have recorded the whole attempt, which is useful: the
 thrust curve tells you whether nothing happened at all or whether the
 motor produced a little pressure and stopped.
 
-### 4.5 After firing: getting the data
+### 4.6 After firing: getting the data
 
 1. Insert the RBF key, disconnect the pyro leads, let the motor cool.
 2. Bring the Pico to the computer and connect it over USB.
@@ -312,7 +362,7 @@ Results land in `results/YYYYMMDD_HHMMSS/` next to the tools folder
 holds 6 burns and overwrites the oldest automatically, so there is
 rarely a reason to erase at all.
 
-### 4.6 Reading the results
+### 4.7 Reading the results
 
 Each burn produces:
 
@@ -341,7 +391,7 @@ The chart sheet has five panels:
 cell saturated, mass loss unmeasurable, motor still burning at the end —
 the script says so instead of printing a confident wrong number.
 
-### 4.7 Reading old data
+### 4.8 Reading old data
 
 CSV files from the original firmware still work:
 
@@ -353,10 +403,10 @@ CSV files from the original firmware still work:
 Those files hold converted newtons rather than raw counts, so they
 cannot be recalibrated — but every timing and impulse figure works.
 
-### 4.8 Trying the tools without hardware
+### 4.9 Trying the tools without hardware
 
 GUI: **Extract & Analyse** tab → **Run demo (no hardware needed)**.
-Console: menu option **8) Demo**. Both generate a realistic fake dataset
+Console: menu option **10) Demo**. Both generate a realistic fake dataset
 and run the whole pipeline on it. Useful for learning what the outputs
 look like before you have a motor on the stand.
 
@@ -373,6 +423,8 @@ i           device status as JSON
 t           zero the load cell
 cal <N>     calibrate with a known force in newtons
 calg <g>    calibrate with a known mass in grams
+calset <c>  set the calibration factor directly, in counts/N
+ign <ms>    set the igniter on-time in milliseconds
 l           list slots
 p           dump every stored burn
 p <slot>    dump one slot

@@ -50,9 +50,12 @@ volatile uint32_t tlm_resume_count = 0;
 volatile uint32_t tlm_last_abort   = 0;   // reason code of the last abort
 
 // requests raised by core 1 (web) and consumed by core 0
-volatile uint32_t req_fire   = 0;
-volatile uint32_t req_abort  = 0;
-volatile uint32_t req_tare   = 0;
+volatile uint32_t req_fire         = 0;
+volatile uint32_t req_abort        = 0;
+volatile uint32_t req_tare         = 0;
+volatile uint32_t req_set_ignition = 0;
+volatile uint32_t req_ignition_ms  = 0;
+volatile uint32_t tlm_ignition_ms  = 0;   // current igniter on-time, for the web UI
 
 // web brute force lockout
 volatile uint32_t web_fails   = 0;
@@ -82,7 +85,8 @@ WebServer server(80);
 //  Runtime state (core 0 only)
 // ---------------------------------------------------------------------
 static StandState state = ST_BOOT;
-static float    calCountsPerN = 1.0f;   // raw counts per newton
+static float    calCountsPerN = DEFAULT_CAL_COUNTS_PER_N;   // raw counts per newton
+static uint32_t ignitionMs    = DEFAULT_IGNITION_MS;         // igniter on-time, ms
 static int32_t  tareOffset    = 0;
 static uint32_t t_state_entry = 0;      // millis() when the state was entered
 static uint32_t t0_us         = 0;      // micros() at the ignition command
@@ -235,7 +239,7 @@ static void printInfoJson() {
                 calCountsPerN, (long)tareOffset,
                 flashLog.ok() ? 1 : 0, flashLog.error(),
                 (unsigned long)PREROLL_MS, (unsigned long)RECORDING_MS,
-                (unsigned long)IGNITION_MS, (unsigned long)COUNTDOWN_MS,
+                (unsigned long)ignitionMs, (unsigned long)COUNTDOWN_MS,
                 (unsigned long)state);
 }
 
@@ -279,6 +283,8 @@ static void printHelp() {
   Serial.println(F("  t          tare (zero) the load cell"));
   Serial.println(F("  cal <N>    calibrate with a known load in newtons"));
   Serial.println(F("  calg <g>   calibrate with a known mass in grams"));
+  Serial.println(F("  calset <c> set the calibration factor directly, in counts/N"));
+  Serial.println(F("  ign <ms>   set the igniter on-time in milliseconds"));
   Serial.println(F("  p          dump every stored burn"));
   Serial.println(F("  p <slot>   dump one slot"));
   Serial.println(F("  l          list slots"));
@@ -327,6 +333,27 @@ static void handleSerial() {
     flashLog.commitJournal();
     Serial.printf("calibrated: %.4f counts/N (%.4f counts/g)\n",
                   calCountsPerN, calCountsPerN * 9.80665f / 1000.0f);
+  } else if (cmd.startsWith("calset ")) {
+    if (state != ST_IDLE) { Serial.println("busy"); return; }
+    float v = cmd.substring(7).toFloat();
+    if (!(v > 0.0f) && !(v < 0.0f)) { Serial.println("value must be nonzero"); return; }
+    calCountsPerN = v;
+    flashLog.journal().cal_counts_per_n = calCountsPerN;
+    flashLog.commitJournal();
+    Serial.printf("calibration factor set to %.4f counts/N (%.4f counts/g)\n",
+                  calCountsPerN, calCountsPerN * 9.80665f / 1000.0f);
+  } else if (cmd.startsWith("ign ")) {
+    if (state != ST_IDLE) { Serial.println("busy"); return; }
+    long ms = cmd.substring(4).toInt();
+    if (ms < 10 || (uint32_t)ms > IGNITION_MAX_MS) {
+      Serial.printf("igniter on-time must be between 10 and %lu ms\n",
+                    (unsigned long)IGNITION_MAX_MS);
+      return;
+    }
+    ignitionMs = (uint32_t)ms;
+    flashLog.journal().ignition_ms = ignitionMs;
+    flashLog.commitJournal();
+    Serial.printf("igniter on-time set to %lu ms\n", (unsigned long)ignitionMs);
   } else if (cmd == "l") {
     for (uint32_t s = 0; s < flashLog.slotCount(); s++) {
       uint32_t pages = flashLog.validPages(s);
@@ -393,7 +420,7 @@ static void openBurnFile() {
   h.tare_offset      = tareOffset;
   h.preroll_ms       = PREROLL_MS;
   h.recording_ms     = RECORDING_MS;
-  h.ignition_ms      = IGNITION_MS;
+  h.ignition_ms      = ignitionMs;
   h.countdown_ms     = COUNTDOWN_MS;
 
   if (!flashLog.startBurn(burnSlot, burnId, h)) {
@@ -447,8 +474,11 @@ void setup() {
 
   if (logOk) {
     calCountsPerN = flashLog.journal().cal_counts_per_n;
-    if (!(calCountsPerN > 0.0f) && !(calCountsPerN < 0.0f)) calCountsPerN = 1.0f;
+    if (!(calCountsPerN > 0.0f) && !(calCountsPerN < 0.0f)) calCountsPerN = DEFAULT_CAL_COUNTS_PER_N;
     tareOffset    = flashLog.journal().tare_offset;
+    ignitionMs    = flashLog.journal().ignition_ms;
+    if (ignitionMs < 10 || ignitionMs > IGNITION_MAX_MS) ignitionMs = DEFAULT_IGNITION_MS;
+    tlm_ignition_ms = ignitionMs;
     flashLog.journal().boot_count++;
     tlm_boot_count   = flashLog.journal().boot_count;
     tlm_total_burns  = flashLog.journal().total_burns;
@@ -551,6 +581,17 @@ void loop() {
     }
   }
 
+  if (req_set_ignition && state == ST_IDLE) {
+    req_set_ignition = 0;
+    uint32_t ms = req_ignition_ms;
+    if (ms >= 10 && ms <= IGNITION_MAX_MS) {
+      ignitionMs = ms;
+      flashLog.journal().ignition_ms = ignitionMs;
+      flashLog.commitJournal();
+    }
+  }
+  tlm_ignition_ms = ignitionMs;
+
   switch (state) {
 
     // -----------------------------------------------------------------
@@ -646,7 +687,7 @@ void loop() {
         pyroOffUs = sinceT0Us;
         Serial.println("pyro hard cut-off");
       }
-      if (pyroOn && sinceT0Us >= IGNITION_MS * 1000UL) {
+      if (pyroOn && sinceT0Us >= ignitionMs * 1000UL) {
         pyroSet(false);
         pyroOffUs = sinceT0Us;
       }
@@ -732,6 +773,7 @@ const char html_page[] PROGMEM = R"rawliteral(
   <div class="row"><span>Storage</span><span class="v" id="log">--</span></div>
   <div class="row"><span>Samples logged</span><span class="v" id="samples">0</span></div>
   <div class="row"><span>Burns stored</span><span class="v" id="burns">0</span></div>
+  <div class="row"><span>Igniter on-time</span><span class="v" id="ignms">-- ms</span></div>
   <div class="row"><span>Last abort</span><span class="v" id="abort">none</span></div>
 </div>
 
@@ -743,20 +785,37 @@ const char html_page[] PROGMEM = R"rawliteral(
   <div class="msg" id="msg"></div>
 </div>
 
+<div class="card">
+  <div class="row"><span>Igniter on-time [ms]</span><span></span></div>
+  <input type="number" id="ignInput" min="10" max="5000" step="10" placeholder="300">
+  <button class="tare" id="ignBtn" onclick="setIgnition()">SET (uses the CODE above)</button>
+</div>
+
 <script>
 const S=["BOOT","IDLE","COUNTDOWN","RECORDING","FAULT","DUMPING"];
 const hist=new Array(160).fill(0);
 const cv=document.getElementById('plot'),cx=cv.getContext('2d');
+// Auto-scales to whatever is actually on screen right now, min AND max
+// (not just abs(max)), so it copes with negative baseline drift or noise
+// instead of assuming thrust is always >= 0. A small minimum span keeps
+// idle noise from being blown up into a huge trace.
 function draw(){
  const w=cv.width,h=cv.height;cx.clearRect(0,0,w,h);
- let mx=1;for(const v of hist)mx=Math.max(mx,Math.abs(v));
+ let lo=0,hi=0;
+ for(const v of hist){if(v<lo)lo=v;if(v>hi)hi=v;}
+ if(hi-lo<1){const mid=(hi+lo)/2;lo=mid-0.5;hi=mid+0.5;}
+ const span=hi-lo,pad=span*0.08;lo-=pad;hi+=pad;
+ const top=8,bot=h-4,rng=bot-top;
+ const yOf=v=>bot-((v-lo)/(hi-lo))*rng;
  cx.strokeStyle='#2c2c2a';cx.lineWidth=1;
- cx.beginPath();cx.moveTo(0,h-4);cx.lineTo(w,h-4);cx.stroke();
+ cx.beginPath();cx.moveTo(0,yOf(0));cx.lineTo(w,yOf(0));cx.stroke();
  cx.strokeStyle='#3987e5';cx.lineWidth=2;cx.beginPath();
- hist.forEach((v,i)=>{const x=i/(hist.length-1)*w,y=h-4-(v/mx)*(h-12);
+ hist.forEach((v,i)=>{const x=i/(hist.length-1)*w,y=yOf(v);
    i?cx.lineTo(x,y):cx.moveTo(x,y);});
  cx.stroke();
- cx.fillStyle='#898781';cx.font='11px system-ui';cx.fillText(mx.toFixed(1)+' N',4,12);
+ cx.fillStyle='#898781';cx.font='11px system-ui';
+ cx.fillText(hi.toFixed(1)+' N',4,12);
+ if(lo<-0.05)cx.fillText(lo.toFixed(1)+' N',4,h-6);
 }
 function cls(el,c){el.className='v '+c;}
 async function tick(){
@@ -780,6 +839,9 @@ async function tick(){
   document.getElementById('burns').textContent=d.burns;
   document.getElementById('abort').textContent=d.abort;
   document.getElementById('fireBtn').disabled=(d.state!=1)||d.rbf;
+  document.getElementById('ignms').textContent=d.ign_ms+' ms';
+  const ii=document.getElementById('ignInput');
+  if(document.activeElement!==ii && !ii.value) ii.placeholder=d.ign_ms;
  }catch(e){document.getElementById('state').textContent='LINK LOST';}
 }
 function msg(t){document.getElementById('msg').textContent=t;
@@ -791,6 +853,13 @@ function fire(){
  if(!confirm('Start the countdown? Everyone clear of the stand?'))return;
  post('/api/fire','?code='+encodeURIComponent(c));
 }
+function setIgnition(){
+ const c=document.getElementById('code').value;
+ const ms=document.getElementById('ignInput').value;
+ if(!c){msg('enter the code above first');return;}
+ if(!ms){msg('enter the on-time in ms');return;}
+ post('/api/set_ignition','?code='+encodeURIComponent(c)+'&ms='+encodeURIComponent(ms));
+}
 setInterval(tick,150);tick();
 </script></body></html>
 )rawliteral";
@@ -798,17 +867,17 @@ setInterval(tick,150);tick();
 static void handleRoot() { server.send_P(200, "text/html", html_page); }
 
 static void handleData() {
-  char json[400];
+  char json[440];
   snprintf(json, sizeof(json),
            "{\"state\":%lu,\"thrust\":%ld,\"raw\":%ld,\"cont\":%d,\"rbf\":%d,\"pyro\":%d,"
            "\"hx\":%d,\"log\":%d,\"free\":%lu,\"t\":%ld,\"samples\":%lu,\"burns\":%lu,"
-           "\"boots\":%lu,\"resumes\":%lu,\"abort\":\"%s\"}",
+           "\"boots\":%lu,\"resumes\":%lu,\"abort\":\"%s\",\"ign_ms\":%lu}",
            (unsigned long)tlm_state, (long)tlm_thrust_mN, (long)tlm_raw,
            tlm_cont ? 1 : 0, tlm_rbf ? 1 : 0, tlm_pyro ? 1 : 0,
            tlm_hx_ok ? 1 : 0, tlm_log_ok ? 1 : 0, (unsigned long)tlm_free_slots,
            (long)tlm_t_ms, (unsigned long)tlm_samples, (unsigned long)tlm_total_burns,
            (unsigned long)tlm_boot_count, (unsigned long)tlm_resume_count,
-           abortName(tlm_last_abort));
+           abortName(tlm_last_abort), (unsigned long)tlm_ignition_ms);
   server.send(200, "application/json", json);
 }
 
@@ -853,14 +922,39 @@ static void handleTare() {
   server.send(200, "text/plain", "tare requested");
 }
 
+static void handleSetIgnition() {
+  uint32_t now = millis();
+  if (web_lock_ms && (int32_t)(now - web_lock_ms) < 0) {
+    server.send(429, "text/plain", "locked out, wait a minute");
+    return;
+  }
+  if (!server.hasArg("code") || !codeMatches(server.arg("code"))) {
+    if (++web_fails >= MAX_FAILED_CODES) { web_lock_ms = now + LOCKOUT_MS; web_fails = 0; }
+    server.send(403, "text/plain", "wrong code");
+    return;
+  }
+  web_fails = 0;
+  if (tlm_state != ST_IDLE) { server.send(409, "text/plain", "not idle"); return; }
+  if (!server.hasArg("ms"))  { server.send(400, "text/plain", "missing ms"); return; }
+  long ms = server.arg("ms").toInt();
+  if (ms < 10 || ms > (long)IGNITION_MAX_MS) {
+    server.send(400, "text/plain", "must be 10 - " + String(IGNITION_MAX_MS) + " ms");
+    return;
+  }
+  req_ignition_ms  = (uint32_t)ms;
+  req_set_ignition = 1;
+  server.send(200, "text/plain", "igniter on-time updated");
+}
+
 void setup1() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/data",  HTTP_GET,  handleData);
-  server.on("/api/fire",  HTTP_POST, handleFire);
-  server.on("/api/abort", HTTP_POST, handleAbort);
-  server.on("/api/tare",  HTTP_POST, handleTare);
+  server.on("/api/data",         HTTP_GET,  handleData);
+  server.on("/api/fire",         HTTP_POST, handleFire);
+  server.on("/api/abort",        HTTP_POST, handleAbort);
+  server.on("/api/tare",         HTTP_POST, handleTare);
+  server.on("/api/set_ignition", HTTP_POST, handleSetIgnition);
   server.onNotFound([]() { server.send(404, "text/plain", "no"); });
   server.begin();
 }
