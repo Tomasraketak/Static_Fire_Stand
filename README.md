@@ -146,7 +146,7 @@ the burn closes. Data integrity always wins over the live view.
 | GP21 | MOSFET gate | **10 kΩ pulldown to GND required** |
 | GP22 | SK6812 / WS2812 | status pixel |
 | GP28 | igniter continuity | HIGH = igniter connected |
-| GP26 | battery voltage | through a resistive divider, see below |
+| GP27 | battery voltage | through a resistive divider, see below |
 
 Powered from a 2S LiPo.
 
@@ -160,18 +160,19 @@ your thrust curve will be a handful of dots.
 ### Battery voltage sense
 
 A simple resistive divider brings the pack voltage down into the RP2040
-ADC's 0-3.3 V range on GP26:
+ADC's 0-3.3 V range on GP27:
 
 ```
-VBATT --[ R_TOP ]--+--[ R_BOTTOM ]-- GND
-                    |
-                   GP26
+VBATT --[ 20 kOhm ]--+--[ 10 kOhm ]-- GND
+                      |
+                     GP27
 ```
 
-The default in `config.h` (`BATT_DIVIDER_RATIO`) assumes 100 kΩ / 47 kΩ
-(ratio 3.128 — a fully charged 8.4 V 2S pack lands at ~2.68 V on the ADC,
-safely inside range). Use your own resistors' actual ratio, or nudge the
-constant until the web UI's reading matches a multimeter on VBATT.
+The default in `config.h` (`BATT_DIVIDER_RATIO`) matches this — 20 kΩ to
+VBATT, 10 kΩ to GND, ratio 3.0 — a fully charged 8.4 V 2S pack lands at
+~2.8 V on the ADC, safely inside range. Use your own resistors' actual
+ratio if you rewire it, or nudge the constant until the web UI's reading
+matches a multimeter on VBATT.
 `BATT_WARN_MV` / `BATT_CRIT_MV` set where the reading turns amber / red —
 both default to a 2S LiPo; adjust them for a different pack. Set
 `BATT_DIVIDER_RATIO` to `0` if the divider isn't populated - the reading
