@@ -14,6 +14,7 @@
 #define PIN_IGNITION  21    // gate of the ignition MOSFET (needs 10k gate pulldown!)
 #define PIN_LED       22    // SK6812 / WS2812 status pixel
 #define PIN_CONT      28    // igniter continuity sense, HIGH = igniter present
+#define PIN_BATT_ADC  26    // battery voltage sense, through the divider below (ADC0)
 
 // ---------------------------------------------------------------------
 //  SEQUENCE TIMING
@@ -61,6 +62,25 @@
 // trusting the numbers: serial `cal`/`calg`/`calset`, the Python GUI's
 // "Stand Tools" tab, or `static_fire.py --calibrate` / `--cal-factor`.
 #define DEFAULT_CAL_COUNTS_PER_N  2291.9275f
+
+// ---------------------------------------------------------------------
+//  BATTERY VOLTAGE
+//  A resistive divider from the battery (2S LiPo, ~6-8.4 V) brings the
+//  pack voltage down into the RP2040 ADC's 0-3.3 V range on PIN_BATT_ADC:
+//
+//      VBATT --[ R_TOP ]--+--[ R_BOTTOM ]-- GND
+//                          |
+//                     PIN_BATT_ADC
+//
+//  BATT_DIVIDER_RATIO is (R_TOP + R_BOTTOM) / R_BOTTOM. The default below
+//  matches 100k/47k (ratio 3.128, giving ~2.68 V at the ADC for a fully
+//  charged 8.4 V pack - comfortably inside range). Recompute it for your
+//  own resistors, or nudge it to match a multimeter reading on VBATT.
+//  Set BATT_DIVIDER_RATIO to 0 to disable the reading entirely (hides it
+//  from the web UI and serial info) if the divider isn't populated.
+#define BATT_DIVIDER_RATIO   3.1277f
+#define BATT_WARN_MV         7000     // 2S LiPo getting low - amber in the web UI
+#define BATT_CRIT_MV         6600     // 2S LiPo close to over-discharge - red
 
 // ---------------------------------------------------------------------
 //  NETWORK

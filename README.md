@@ -102,17 +102,36 @@ operator's job either way** — see the [firing checklist](#44-firing).
 
 ### Web UI
 
-Live thrust plot, countdown, storage status, ABORT and TARE buttons, a
-settings card to change the igniter on-time, and the reason the last
-sequence was aborted. Core 1 (the web server) **never touches flash or
-the igniter** — it can only raise a request that core 0 validates against
-the physical interlocks, so the START COUNTDOWN button rejects the same
-conditions the physical interlocks do (busy, RBF key in, storage or load
-cell fault, and igniter continuity too if `REQUIRE_CONTINUITY_TO_ARM` is
-turned back on) with an on-screen reason rather than a false "countdown
-started". The live plot auto-scales to whatever is currently on screen
-(min *and* max, not just peak), with a small minimum span so idle noise
-does not get blown up into a huge trace.
+Live thrust plot, battery voltage, countdown, storage status, ABORT and
+TARE buttons, a settings card to change the igniter on-time, and the
+reason the last sequence was aborted. Core 1 (the web server) **never
+touches flash or the igniter** — it can only raise a request that core 0
+validates against the physical interlocks, so the START COUNTDOWN button
+rejects the same conditions the physical interlocks do (busy, RBF key in,
+storage or load cell fault, and igniter continuity too if
+`REQUIRE_CONTINUITY_TO_ARM` is turned back on) with an on-screen reason
+rather than a false "countdown started". The live plot auto-scales to
+whatever is currently on screen (min *and* max, not just peak), with a
+small minimum span so idle noise does not get blown up into a huge trace.
+
+**Storage** shows how many of the device's burn slots have never been
+written yet — once every slot has held a burn at least once (a device
+with `LOG_SLOTS` set to 6 stores its 6 most recent burns), it reads `0
+slots free` and names which stored burn the *next* recording would
+overwrite, so download it first if you still need it.
+
+**The page goes quiet for the ~13 s a burn is actually recording** (from
+the preroll opening to the burn closing) — the thrust plot and timer
+freeze, requests stall, and it may briefly say `LINK LOST`. This is
+deliberate, not a fault. Writing each flash page pauses core 1 (the WiFi
+and web server) so the write is safe, and if core 1 were mid-way through
+answering an HTTP request right then, that pause could stretch into
+hundreds of milliseconds - which shows up as genuinely lost data, a
+`largest gap between samples` warning in the analysis, since the load
+cell keeps converting on its own clock the whole time core 0 is stalled.
+So core 1 stays off the network for the recording window instead,
+trading a frozen page for a clean record. It catches up immediately once
+the burn closes. Data integrity always wins over the live view.
 
 ---
 
@@ -127,6 +146,7 @@ does not get blown up into a huge trace.
 | GP21 | MOSFET gate | **10 kΩ pulldown to GND required** |
 | GP22 | SK6812 / WS2812 | status pixel |
 | GP28 | igniter continuity | HIGH = igniter connected |
+| GP26 | battery voltage | through a resistive divider, see below |
 
 Powered from a 2S LiPo.
 
@@ -136,6 +156,26 @@ will show up on your thrust curve.
 
 **Tie the HX711 RATE pin to VCC.** Left floating it runs at 10 SPS and
 your thrust curve will be a handful of dots.
+
+### Battery voltage sense
+
+A simple resistive divider brings the pack voltage down into the RP2040
+ADC's 0-3.3 V range on GP26:
+
+```
+VBATT --[ R_TOP ]--+--[ R_BOTTOM ]-- GND
+                    |
+                   GP26
+```
+
+The default in `config.h` (`BATT_DIVIDER_RATIO`) assumes 100 kΩ / 47 kΩ
+(ratio 3.128 — a fully charged 8.4 V 2S pack lands at ~2.68 V on the ADC,
+safely inside range). Use your own resistors' actual ratio, or nudge the
+constant until the web UI's reading matches a multimeter on VBATT.
+`BATT_WARN_MV` / `BATT_CRIT_MV` set where the reading turns amber / red —
+both default to a 2S LiPo; adjust them for a different pack. Set
+`BATT_DIVIDER_RATIO` to `0` if the divider isn't populated - the reading
+is then hidden instead of showing a meaningless number.
 
 ### Status pixel
 
@@ -328,11 +368,15 @@ Run through this at the bench, before anything is live:
 9. **Type the code and press START COUNTDOWN.** Confirm the dialog.
 10. **The countdown runs for 15 s.** The pixel blinks red, faster as T0
     approaches, and the web page counts down `T-14.3 s`. The recorder
-    opens 3 s before T0 and starts banking baseline samples.
+    opens 3 s before T0 and starts banking baseline samples - **the page
+    freezes at that point and stays quiet until the burn closes**, on
+    purpose (see [Web UI](#web-ui) above). The pixel keeps working as
+    normal through this; use it, not the page, to see where the sequence
+    is.
 11. **T0.** The igniter is energised for 3 s or until the hard cut-off.
     Recording continues for 10 s.
-12. **The pixel goes back to blue/yellow** and the web page returns to
-    `IDLE`. The burn is on flash.
+12. **The pixel goes back to blue/yellow** and the web page catches up
+    and returns to `IDLE`. The burn is on flash.
 
 **To abort at any point during the countdown:** press ABORT on the web
 page, or insert the RBF key, or hold the physical button. Any of the
@@ -385,18 +429,31 @@ rarely a reason to erase at all.
 
 ### 4.7 Reading the results
 
-Each burn produces:
+Each burn gets its own subfolder:
 
 ```
 results/20260716_135131/
 ├── raw_dump.txt                 what the stand sent (keep this)
-├── burn_001_data.csv            raw samples, Excel-ready
-├── burn_001_data.xlsx           Summary + Data + Rise sheets, with a chart
-├── burn_001_summary.csv         just the summary table
-├── burn_001_charts.png          five charts on one sheet
+├── burn_001/
+│   ├── burn_001_data.csv        raw samples, Excel-ready
+│   ├── burn_001_data.xlsx       Summary + Data + Rise sheets, with a chart
+│   ├── burn_001_summary.csv     just the summary table
+│   └── burn_001_charts.png      five charts on one sheet
+├── burn_002/
+│   └── ...
 ├── all_burns_overview.csv       one row per burn, for comparing batches
 └── burn_comparison.png          every curve overlaid
 ```
+
+If a `burn_001` folder already exists in that output folder — analysing
+into the same fixed `--output` folder twice, for instance — the newer
+one is written to `burn_001_1` instead (then `burn_001_2`, and so on)
+rather than overwriting it.
+
+Right under the title, every chart sheet and the burn-comparison overlay
+both state the propellant mass, Isp and the calibration factor
+(counts/N) used for that burn — the three numbers people ask about first
+when comparing charts, without having to open the summary CSV.
 
 The chart sheet has five panels:
 

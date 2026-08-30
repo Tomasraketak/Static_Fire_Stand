@@ -64,6 +64,15 @@ def _ok(v) -> bool:
     return v is not None and isinstance(v, float) and not math.isnan(v)
 
 
+def _info_line(burn: Burn, r: Result) -> str:
+    """Propellant mass, Isp and the calibration factor used for this burn -
+    the three numbers people ask about first when comparing charts."""
+    mass = f"{r.prop_mass_kg * 1000:.1f} g" if r.prop_mass_kg > 0 else "n/a"
+    isp = f"{r.isp:.1f} s" if _ok(r.isp) else "n/a"
+    return (f"Propellant {mass}   .   Isp {isp}   .   "
+            f"Cal {burn.cal_counts_per_n:.1f} counts/N")
+
+
 # ---------------------------------------------------------------------
 #  The chart sheet
 # ---------------------------------------------------------------------
@@ -75,6 +84,8 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
     fig.suptitle(f"Static fire #{r.burn_id}   .   {r.motor_designation}   .   "
                  f"{r.total_impulse:.1f} N.s",
                  color=C_INK, fontsize=17, fontweight="700", x=0.045, ha="left", y=0.985)
+    fig.text(0.045, 0.958, _info_line(burn, r), color=C_INK2, fontsize=11,
+             ha="left", va="top")
 
     # The record is normally much longer than the burn, so the charts are
     # cropped around the interesting part - otherwise the curve would be a
@@ -252,9 +263,12 @@ def plot_comparison(pairs: list[tuple[Burn, Result]], outdir: Path) -> Path | No
     fig, ax = plt.subplots(figsize=(11, 6), facecolor=C_SURFACE)
     _style(ax, "Time from fire command [s]", "Thrust above rest [N]", "Burn comparison")
     for i, (b, r) in enumerate(pairs[:8]):
+        mass = f"{r.prop_mass_kg * 1000:.0f} g" if r.prop_mass_kg > 0 else "mass n/a"
+        isp = f"Isp {r.isp:.0f} s" if _ok(r.isp) else "Isp n/a"
         ax.plot(r.curve["t"], r.curve["thrust"] - r.curve["baseline"],
                 color=SERIES[i % len(SERIES)], linewidth=2.0, zorder=4,
-                label=f"#{r.burn_id} . {r.motor_designation} . {r.total_impulse:.1f} N.s")
+                label=f"#{r.burn_id} . {r.motor_designation} . {r.total_impulse:.1f} N.s . "
+                      f"{mass} . {isp}")
     leg = ax.legend(loc="upper right", frameon=False, fontsize=9)
     for txt in leg.get_texts():
         txt.set_color(C_INK2)

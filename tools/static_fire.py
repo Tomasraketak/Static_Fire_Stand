@@ -95,6 +95,25 @@ def print_report(burn, r) -> None:
             print(f"    ! {note}")
 
 
+def burn_subdir(outdir: Path, burn_id: int) -> Path:
+    """A fresh, collision-safe subfolder for one burn's files.
+
+    burn_001, burn_002, ... - and if that name is already taken (analysing
+    into an output folder that already has a burn with this id, e.g. a
+    re-download or a fixed --output folder used more than once) it falls
+    back to burn_001_1, then burn_001_2, and so on rather than overwriting
+    someone else's files.
+    """
+    base = f"burn_{burn_id:03d}"
+    candidate = outdir / base
+    n = 0
+    while candidate.exists():
+        n += 1
+        candidate = outdir / f"{base}_{n}"
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
 def run_analysis(burns, outdir: Path, fuel_g: float | None = None,
                  sigma: float = 6.0, make_plots: bool = True,
                  show: bool = False) -> list:
@@ -107,17 +126,18 @@ def run_analysis(burns, outdir: Path, fuel_g: float | None = None,
         pairs.append((burn, r))
         print_report(burn, r)
 
-        made = [export_csv(burn, r, outdir),
-                export_summary_csv(summary_rows(burn, r), r, outdir)]
-        xlsx = export_xlsx(burn, r, outdir)
+        burn_dir = burn_subdir(outdir, r.burn_id)
+        made = [export_csv(burn, r, burn_dir),
+                export_summary_csv(summary_rows(burn, r), r, burn_dir)]
+        xlsx = export_xlsx(burn, r, burn_dir)
         if xlsx:
             made.append(xlsx)
         else:
             print("    (openpyxl is missing, .xlsx skipped - "
                   "install it with: pip install openpyxl)")
         if make_plots:
-            made.append(plot_burn(burn, r, outdir, show=show))
-        print("\n  Written:")
+            made.append(plot_burn(burn, r, burn_dir, show=show))
+        print(f"\n  Written to {burn_dir.relative_to(outdir)}/:")
         for path in made:
             print(f"    {path.name}")
 
