@@ -43,8 +43,43 @@
 // ---------------------------------------------------------------------
 #define REQUIRE_CONTINUITY_TO_ARM  0   // refuse to arm without igniter continuity
 #define ABORT_ON_CONT_LOSS         0   // abort countdown if continuity disappears
-#define BTN_HOLD_MS              750UL // physical button must be held this long
+#define BTN_HOLD_MS              500UL // physical button must be held this long
+// After the button triggers, it is not looked at AT ALL for this long, and
+// then has to be released before it counts again. The same press starting a
+// countdown must not be able to abort it a millisecond later.
+// Note this is the only thing the button is deaf to - ABORT in the web UI
+// and the RBF key both still stop the sequence instantly.
+#define BTN_LOCKOUT_MS          2000UL
 #define WDT_TIMEOUT_MS           4000  // hardware watchdog
+
+// ---------------------------------------------------------------------
+//  KEEPING THE SAMPLE DROPOUTS OUT OF THE BURN
+//
+//  Something on this board stalls core 0 for a few hundred milliseconds
+//  at a time, and it repeats on its own clock (~7.45 s on the stand this
+//  was measured on) rather than in step with anything the sequence does.
+//  Whenever one lands during the burn it eats ~30 samples and the
+//  analysis reports a "largest gap between samples" warning.
+//
+//  The stalls cannot be prevented from here, but they can be dodged: the
+//  firmware times its own sampling, learns the period, and then picks a
+//  countdown length that puts the protected window between two of them.
+//  The countdown shown to the operator is the adjusted one, so it still
+//  counts down to the real T0 and reaches zero exactly at ignition -
+//  nothing fires late or unannounced.
+//
+//  Set STALL_AVOIDANCE to 0 to switch it off and always use COUNTDOWN_MS
+//  exactly. Nothing else changes; a dodge is only ever attempted when a
+//  stable period has actually been measured recently.
+#define STALL_AVOIDANCE             1
+#define STALL_PROTECT_MS       4000UL  // keep T0 .. T0+this clear of a stall
+#define STALL_GUARD_MS          500UL  // extra margin either side of the window
+#define STALL_MAX_SHIFT_MS     8000UL  // never delay T0 by more than this
+#define STALL_MIN_MS            100UL  // a sample gap this big counts as a stall
+#define STALL_PERIOD_MIN_MS    1000UL  // plausible range for the repeat period
+#define STALL_PERIOD_MAX_MS   60000UL
+#define STALL_PERIOD_TOL_MS     400UL  // two periods this close count as agreeing
+#define STALL_FRESH_MS        120000UL // ignore a pattern not seen for this long
 #define MAX_FAILED_CODES            5  // web lockout after N wrong codes
 #define LOCKOUT_MS              60000UL
 

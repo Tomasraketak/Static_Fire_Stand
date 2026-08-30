@@ -106,7 +106,10 @@ static bool     prerollOpen   = false;
 static bool     resumedBurn   = false;
 static uint32_t eraseCursor   = 0;
 static uint32_t eraseSlotIdx  = 0xFFFFFFFFu;
+static uint32_t countdownMs   = COUNTDOWN_MS;  // this run's countdown, see plannedCountdownMs()
 static uint32_t btnDownSince  = 0;
+static uint32_t btnIgnoreUntil = 0;   // button deaf until this millis()
+static bool     btnLatched    = false; // must be released before it counts again
 static uint32_t lastLedUpdate = 0;
 static bool     dumping       = false;
 
@@ -177,6 +180,41 @@ static void updateLED() {
 // ---------------------------------------------------------------------
 static uint32_t sensorFaultSince = 0;
 
+// ---------------------------------------------------------------------
+//  Stall watcher
+//
+//  The gap between two conversions is the one thing that reveals core 0
+//  having been blocked, whatever did it. Anything an order of magnitude
+//  over the nominal 10.7 ms is a stall; if they keep arriving the same
+//  distance apart, that period is worth knowing, because it lets the
+//  countdown be chosen so the burn falls between two of them.
+// ---------------------------------------------------------------------
+static uint32_t stallLastMs   = 0;   // when the last stall was seen
+static uint32_t stallPeriodMs = 0;   // measured repeat period, 0 = unknown
+static uint8_t  stallAgree    = 0;   // consecutive intervals that agreed
+static uint32_t stallCount    = 0;   // total seen, for the record
+
+static void noteStall(uint32_t nowMs) {
+  stallCount++;
+  if (stallLastMs) {
+    uint32_t gap = nowMs - stallLastMs;
+    if (gap >= STALL_PERIOD_MIN_MS && gap <= STALL_PERIOD_MAX_MS) {
+      uint32_t diff = (gap > stallPeriodMs) ? gap - stallPeriodMs : stallPeriodMs - gap;
+      if (stallPeriodMs && diff <= STALL_PERIOD_TOL_MS) {
+        if (stallAgree < 255) stallAgree++;
+        stallPeriodMs = (stallPeriodMs + gap) / 2;   // gentle smoothing
+      } else {
+        stallPeriodMs = gap;                          // new candidate period
+        stallAgree = 0;
+      }
+    } else {
+      stallPeriodMs = 0;                              // nothing periodic here
+      stallAgree = 0;
+    }
+  }
+  stallLastMs = nowMs;
+}
+
 // Reads the load cell if a conversion is waiting. When a burn is open the
 // sample is appended to the flash log. Returns true if a sample was taken.
 static bool serviceLoadCell() {
@@ -191,6 +229,13 @@ static bool serviceLoadCell() {
   int32_t raw   = scale.readRaw();
   tlm_hx_ok = 1;
   sensorFaultSince = 0;
+
+  // Time our own sampling. A gap far past nominal means core 0 was held up.
+  static uint32_t lastSampleUs = 0;
+  if (lastSampleUs && (uint32_t)(t_us - lastSampleUs) > STALL_MIN_MS * 1000UL) {
+    noteStall(millis());
+  }
+  lastSampleUs = t_us;
 
   tlm_raw = raw;
   tlm_thrust_mN = (int32_t)(rawToN(raw) * 1000.0f);
@@ -249,7 +294,8 @@ static void printInfoJson() {
                 "\"samples_per_page\":%u,"
                 "\"cal_counts_per_n\":%.6f,\"tare\":%ld,\"log_ok\":%d,\"log_err\":\"%s\","
                 "\"preroll_ms\":%lu,\"recording_ms\":%lu,\"ignition_ms\":%lu,"
-                "\"countdown_ms\":%lu,\"state\":%lu,\"batt_mV\":%ld}\n",
+                "\"countdown_ms\":%lu,\"state\":%lu,\"batt_mV\":%ld,"
+                "\"stall_count\":%lu,\"stall_period_ms\":%lu,\"stall_agree\":%u}\n",
                 FW_VERSION,
                 (unsigned long)flashLog.journal().boot_count,
                 (unsigned long)flashLog.journal().resume_count,
@@ -261,8 +307,10 @@ static void printInfoJson() {
                 calCountsPerN, (long)tareOffset,
                 flashLog.ok() ? 1 : 0, flashLog.error(),
                 (unsigned long)PREROLL_MS, (unsigned long)RECORDING_MS,
-                (unsigned long)ignitionMs, (unsigned long)COUNTDOWN_MS,
-                (unsigned long)state, (long)tlm_batt_mV);
+                (unsigned long)ignitionMs, (unsigned long)countdownMs,
+                (unsigned long)state, (long)tlm_batt_mV,
+                (unsigned long)stallCount, (unsigned long)stallPeriodMs,
+                (unsigned)stallAgree);
 }
 
 // Dumps raw 256 byte pages as base64, one line per page. Every page
@@ -316,6 +364,40 @@ static void printHelp() {
 }
 
 static void abortSequence(uint32_t reason);
+
+// How long this particular countdown should run.
+//
+// Normally exactly COUNTDOWN_MS. When a repeating stall has been measured
+// recently, the length is stretched by up to STALL_MAX_SHIFT_MS so that
+// T0 .. T0+STALL_PROTECT_MS lands between two stalls instead of across
+// one. Chosen once, here, before the countdown starts - so the number the
+// operator watches counts down to the real T0 and hits zero at ignition.
+static uint32_t plannedCountdownMs(uint32_t startMs) {
+#if STALL_AVOIDANCE
+  if (stallAgree >= 2 && stallPeriodMs >= STALL_PERIOD_MIN_MS &&
+      (uint32_t)(millis() - stallLastMs) < STALL_FRESH_MS) {
+    const uint32_t need = STALL_PROTECT_MS + STALL_GUARD_MS;
+    for (uint32_t add = 0; add <= STALL_MAX_SHIFT_MS; add += 100) {
+      uint32_t t0    = startMs + COUNTDOWN_MS + add;
+      uint32_t phase = (uint32_t)(t0 - stallLastMs) % stallPeriodMs;  // since last stall
+      uint32_t next  = stallPeriodMs - phase;                         // until the next
+      if (phase >= STALL_GUARD_MS && next >= need) {
+        if (add) {
+          Serial.printf("stall dodge: period %lu ms, countdown stretched by %lu ms "
+                        "to keep T0..T0+%lu clear\n",
+                        (unsigned long)stallPeriodMs, (unsigned long)add,
+                        (unsigned long)STALL_PROTECT_MS);
+        }
+        return COUNTDOWN_MS + add;
+      }
+    }
+    Serial.println("stall dodge: no clear slot found, using the normal countdown");
+  }
+#else
+  (void)startMs;
+#endif
+  return COUNTDOWN_MS;
+}
 
 static void handleSerial() {
   if (!Serial.available()) return;
@@ -444,7 +526,7 @@ static void openBurnFile() {
   h.preroll_ms       = PREROLL_MS;
   h.recording_ms     = RECORDING_MS;
   h.ignition_ms      = ignitionMs;
-  h.countdown_ms     = COUNTDOWN_MS;
+  h.countdown_ms     = countdownMs;
 
   if (!flashLog.startBurn(burnSlot, burnId, h)) {
     abortSequence(AB_STORAGE);
@@ -619,13 +701,34 @@ void loop() {
     tlm_batt_mV = readBatteryMv();
   }
 
-  // physical button: must be held, and only counts when the key is out
+  // ---- physical button -------------------------------------------------
+  // Held for BTN_HOLD_MS to count, then latched until it is released, then
+  // ignored entirely for BTN_LOCKOUT_MS.
+  //
+  // The latch is the point. This used to push btnDownSince 100 s into the
+  // future to mean "do not fire again", but millis() - btnDownSince is
+  // unsigned, so that underflowed to ~4.29e9 and the condition became
+  // permanently true: every single loop raised btnFire for as long as the
+  // button was down. The first one started the countdown and the next one,
+  // microseconds later, hit the abort test in ST_COUNTDOWN and killed it.
+  // Starting a burn from the button was effectively impossible.
   bool btnFire = false;
-  if (btn) {
-    if (!btnDownSince) btnDownSince = millis();
-    else if (millis() - btnDownSince > BTN_HOLD_MS) { btnFire = true; btnDownSince = millis() + 100000UL; }
+  if (btnIgnoreUntil && (int32_t)(millis() - btnIgnoreUntil) < 0) {
+    btnDownSince = 0;         // deaf window - do not even look at the pin
+    btnLatched = true;        // and demand a release once it reopens
+  } else if (btn) {
+    if (btnLatched) {
+      // still the press that already fired - wait for it to be let go
+    } else if (!btnDownSince) {
+      btnDownSince = millis();
+    } else if (millis() - btnDownSince >= BTN_HOLD_MS) {
+      btnFire = true;
+      btnLatched = true;
+      btnIgnoreUntil = millis() + BTN_LOCKOUT_MS;
+    }
   } else {
     btnDownSince = 0;
+    btnLatched = false;
   }
 
   if (req_tare && state == ST_IDLE) {
@@ -678,7 +781,8 @@ void loop() {
       if (req_fire || btnFire) {
         req_fire = 0;
         if (interlocksOk(why)) {
-          Serial.printf("COUNTDOWN started (%lu ms)\n", (unsigned long)COUNTDOWN_MS);
+          countdownMs = plannedCountdownMs(millis());
+          Serial.printf("COUNTDOWN started (%lu ms)\n", (unsigned long)countdownMs);
           tlm_last_abort = AB_NONE;
           resumedBurn = false;
           enterState(ST_COUNTDOWN);
@@ -692,7 +796,7 @@ void loop() {
     // -----------------------------------------------------------------
     case ST_COUNTDOWN: {
       uint32_t elapsed = millis() - t_state_entry;
-      int32_t  rem     = (int32_t)COUNTDOWN_MS - (int32_t)elapsed;
+      int32_t  rem     = (int32_t)countdownMs - (int32_t)elapsed;
       tlm_t_ms = rem;
 
       if (rbf)                     { abortSequence(AB_RBF);       break; }
@@ -833,6 +937,7 @@ const char html_page[] PROGMEM = R"rawliteral(
   <div class="row"><span>Samples logged</span><span class="v" id="samples">0</span></div>
   <div class="row"><span>Burns stored</span><span class="v" id="burns">0</span></div>
   <div class="row"><span>Igniter on-time</span><span class="v" id="ignms">-- ms</span></div>
+  <div class="row"><span>Dropout dodge</span><span class="v" id="stall">--</span></div>
   <div class="row"><span>Last abort</span><span class="v" id="abort">none</span></div>
 </div>
 
@@ -917,6 +1022,10 @@ async function tick(){
   document.getElementById('abort').textContent=d.abort;
   document.getElementById('fireBtn').disabled=(d.state!=1)||d.rbf;
   document.getElementById('ignms').textContent=d.ign_ms+' ms';
+  const sd=document.getElementById('stall');
+  if(d.stall_ok){sd.textContent='armed ('+(d.stall_ms/1000).toFixed(2)+' s cycle)';cls(sd,'ok');}
+  else if(d.stall_ms){sd.textContent='learning...';cls(sd,'warn');}
+  else {sd.textContent='no pattern seen';cls(sd,'ok');}
   const ii=document.getElementById('ignInput');
   if(document.activeElement!==ii && !ii.value) ii.placeholder=d.ign_ms;
  }catch(e){document.getElementById('state').textContent='LINK LOST';}
@@ -945,13 +1054,14 @@ tick();
 static void handleRoot() { server.send_P(200, "text/html", html_page); }
 
 static void handleData() {
-  char json[540];
+  char json[600];
   snprintf(json, sizeof(json),
            "{\"state\":%lu,\"thrust\":%ld,\"raw\":%ld,\"cont\":%d,\"rbf\":%d,\"pyro\":%d,"
            "\"hx\":%d,\"log\":%d,\"free\":%lu,\"next_overwrite\":%lu,\"t\":%ld,"
            "\"samples\":%lu,\"burns\":%lu,"
            "\"boots\":%lu,\"resumes\":%lu,\"abort\":\"%s\",\"ign_ms\":%lu,\"batt_mV\":%ld,"
-           "\"batt_warn_mV\":%d,\"batt_crit_mV\":%d}",
+           "\"batt_warn_mV\":%d,\"batt_crit_mV\":%d,"
+           "\"stall_ms\":%lu,\"stall_ok\":%d}",
            (unsigned long)tlm_state, (long)tlm_thrust_mN, (long)tlm_raw,
            tlm_cont ? 1 : 0, tlm_rbf ? 1 : 0, tlm_pyro ? 1 : 0,
            tlm_hx_ok ? 1 : 0, tlm_log_ok ? 1 : 0, (unsigned long)tlm_free_slots,
@@ -959,7 +1069,9 @@ static void handleData() {
            (long)tlm_t_ms, (unsigned long)tlm_samples, (unsigned long)tlm_total_burns,
            (unsigned long)tlm_boot_count, (unsigned long)tlm_resume_count,
            abortName(tlm_last_abort), (unsigned long)tlm_ignition_ms, (long)tlm_batt_mV,
-           (int)BATT_WARN_MV, (int)BATT_CRIT_MV);
+           (int)BATT_WARN_MV, (int)BATT_CRIT_MV,
+           (unsigned long)stallPeriodMs,
+           (stallAgree >= 2 && stallPeriodMs) ? 1 : 0);
   server.send(200, "application/json", json);
 }
 
