@@ -17,9 +17,18 @@ import matplotlib
 import numpy as np
 import pandas as pd
 
-# On a headless machine (CI, SSH) a non-interactive backend is required;
-# on Windows and macOS let matplotlib choose so that "show charts" works.
-if not (os.environ.get("DISPLAY") or sys.platform.startswith(("win", "darwin"))):
+# Always render through Agg unless the caller explicitly asked for an
+# on-screen window (SF_SHOW_CHARTS=1, set by the --show path).
+#
+# The GUI runs the analysis on a worker thread, and every interactive
+# backend - TkAgg on Windows, MacOSX on a Mac - has to be driven from the
+# main thread. Creating a figure off it produces "Starting a Matplotlib GUI
+# outside of the main thread will likely fail" and then, depending on the
+# machine, no PNG at all. Writing files never needs a GUI backend, so the
+# default is the one that always works and the window is opt-in.
+if os.environ.get("SF_SHOW_CHARTS") != "1":
+    matplotlib.use("Agg")
+elif not (os.environ.get("DISPLAY") or sys.platform.startswith(("win", "darwin"))):
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import AutoMinorLocator  # noqa: E402
@@ -177,13 +186,25 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
                 lines.append(f"{pct:>3} % of peak {tv*1000:7.0f} ms")
         if _ok(r.rise_10_90):
             lines.append(f"rise 10-90 %  {r.rise_10_90*1000:7.0f} ms")
-        # Put the block on whichever side the curve is not: a long
-        # ignition delay pushes the rise to the right, a short one left.
-        x0, x1 = -0.25, zoom_hi
-        peak_frac = ((r.t_peak - x0) / (x1 - x0)) if _ok(r.t_peak) else 0.5
-        bx, ha = (0.025, "left") if peak_frac > 0.5 else (0.975, "right")
-        ax.text(bx, 0.97, "\n".join(lines), transform=ax.transAxes,
-                ha=ha, va="top", fontsize=9, color=C_INK2, family="monospace",
+        # Drop the block into whichever corner the trace actually leaves
+        # free. Guessing from the peak position alone put it straight on top
+        # of the curve as soon as the motor was already running at the left
+        # edge (an early ignition fills the whole panel), so count how many
+        # samples fall in each corner and take the emptiest.
+        zt = z["t"].to_numpy(dtype=float)
+        zn = (z["thrust"] - r.baseline_n).to_numpy(dtype=float)
+        # np.ptp(), not ndarray.ptp() - the method was removed in NumPy 2.
+        xs = (zt - zt.min()) / max(float(np.ptp(zt)), 1e-9)
+        ys = (zn - zn.min()) / max(float(np.ptp(zn)), 1e-9)
+        corners = {                       # (x anchor, ha, y anchor, va)
+            (0.025, "left", 0.97, "top"):     ((xs < 0.45) & (ys > 0.55)),
+            (0.975, "right", 0.97, "top"):    ((xs > 0.55) & (ys > 0.55)),
+            (0.025, "left", 0.03, "bottom"):  ((xs < 0.45) & (ys < 0.45)),
+            (0.975, "right", 0.03, "bottom"): ((xs > 0.55) & (ys < 0.45)),
+        }
+        bx, ha, by, va = min(corners, key=lambda k: int(corners[k].sum()))
+        ax.text(bx, by, "\n".join(lines), transform=ax.transAxes,
+                ha=ha, va=va, fontsize=9, color=C_INK2, family="monospace",
                 bbox=dict(boxstyle="round,pad=0.5", facecolor=C_SURFACE,
                           edgecolor=C_GRID))
 
@@ -197,7 +218,10 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
         cum = np.concatenate([[0.0], np.cumsum(0.5 * (net[1:] + net[:-1]) * np.diff(t))])
         ax.plot(t, cum, color=C_IMPULSE, linewidth=2.0, zorder=4)
         ax.fill_between(t, 0, cum, color=C_IMPULSE, alpha=0.10, zorder=2)
-        ax.set_xlim(0, t_view)
+        # Starts where the integration does, which is before T0 when the
+        # motor lit early - clipping at 0 there would draw the curve already
+        # part way up and make it look like impulse appeared from nowhere.
+        ax.set_xlim(min(0.0, float(t[0])), t_view)
         if _ok(r.t_half_impulse):
             ax.plot([r.t_half_impulse], [np.interp(r.t_half_impulse, t, cum)], "o",
                     markersize=8, color=C_INK, markeredgecolor=C_SURFACE,
@@ -337,6 +361,14 @@ def export_summary_csv(rows: list[tuple[str, str]], r: Result, outdir: Path) -> 
             if k != "Firmware":
                 v = re.sub(r"(?<=\d)\.(?=\d)", ",", v)
             fh.write(f"{k};{v}\r\n")
+        # The warnings are the half of the report that says which of the
+        # numbers above to trust - they belong in the file people open, not
+        # only in the console that has already scrolled past.
+        if r.warnings:
+            fh.write("\r\n")
+            fh.write("WARNINGS;\r\n")
+            for note in r.warnings:
+                fh.write(f";{note}\r\n")
     return path
 
 
