@@ -33,6 +33,7 @@ import datetime as dt
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -121,25 +122,41 @@ def run_analysis(burns, outdir: Path, fuel_g: float | None = None,
                            export_xlsx, plot_burn, plot_comparison)
 
     pairs = []
+    failed = []
     for burn in burns:
-        r = analyze(burn, prop_mass_g=fuel_g, detect_sigma=sigma)
-        pairs.append((burn, r))
-        print_report(burn, r)
+        # One awkward record must never cost you the rest of the download.
+        # A single burn whose pre-roll was not at rest used to raise inside
+        # the chart code and abort the whole batch - three good burns lost
+        # to one odd one, with the raw dump the only thing left.
+        try:
+            r = analyze(burn, prop_mass_g=fuel_g, detect_sigma=sigma)
+            pairs.append((burn, r))
+            print_report(burn, r)
 
-        burn_dir = burn_subdir(outdir, r.burn_id)
-        made = [export_csv(burn, r, burn_dir),
-                export_summary_csv(summary_rows(burn, r), r, burn_dir)]
-        xlsx = export_xlsx(burn, r, burn_dir)
-        if xlsx:
-            made.append(xlsx)
-        else:
-            print("    (openpyxl is missing, .xlsx skipped - "
-                  "install it with: pip install openpyxl)")
-        if make_plots:
-            made.append(plot_burn(burn, r, burn_dir, show=show))
-        print(f"\n  Written to {burn_dir.relative_to(outdir)}/:")
-        for path in made:
-            print(f"    {path.name}")
+            burn_dir = burn_subdir(outdir, r.burn_id)
+            made = [export_csv(burn, r, burn_dir),
+                    export_summary_csv(summary_rows(burn, r), r, burn_dir)]
+            xlsx = export_xlsx(burn, r, burn_dir)
+            if xlsx:
+                made.append(xlsx)
+            else:
+                print("    (openpyxl is missing, .xlsx skipped - "
+                      "install it with: pip install openpyxl)")
+            if make_plots:
+                try:
+                    made.append(plot_burn(burn, r, burn_dir, show=show))
+                except Exception as exc:                      # noqa: BLE001
+                    print(f"    (chart failed for burn {r.burn_id}: {exc})")
+                    traceback.print_exc()
+            print(f"\n  Written to {burn_dir.relative_to(outdir)}/:")
+            for path in made:
+                print(f"    {path.name}")
+        except Exception as exc:                              # noqa: BLE001
+            failed.append(burn.burn_id)
+            print(f"\n  !! burn {burn.burn_id} could not be analysed: {exc}")
+            traceback.print_exc()
+            print("     Carrying on with the remaining burns; the raw dump still "
+                  "has everything.")
 
     if len(pairs) > 1:
         print(f"\n  Overview:   {export_overview_csv(pairs, outdir).name}")
@@ -148,7 +165,10 @@ def run_analysis(burns, outdir: Path, fuel_g: float | None = None,
             if cmp_path:
                 print(f"  Comparison: {cmp_path.name}")
 
-    print(f"\nDone. Everything is in:\n  {outdir}")
+    if failed:
+        print("\n  WARNING: these burns could not be analysed: "
+              + ", ".join(f"#{i}" for i in failed))
+    print(f"\nDone. {len(pairs)} of {len(burns)} burn(s) analysed. Everything is in:\n  {outdir}")
     return pairs
 
 
@@ -624,7 +644,13 @@ def main() -> int:
     # file, so show the menu rather than a usage message.
     if len(sys.argv) <= 1:
         return interactive()
-    return cli(build_parser().parse_args())
+    args = build_parser().parse_args()
+    # sf_report picks its matplotlib backend at import time; it needs to know
+    # before then whether a window will be wanted, because the interactive
+    # backends only work from the main thread.
+    if getattr(args, "show", False):
+        os.environ["SF_SHOW_CHARTS"] = "1"
+    return cli(args)
 
 
 if __name__ == "__main__":

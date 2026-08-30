@@ -28,7 +28,14 @@ class Result:
     baseline_noise_rms: float = 0.0
     baseline_drift_n_per_s: float = 0.0
     baseline_samples: int = 0
+    baseline_rejected: int = 0    # pre-roll samples excluded as not-at-rest
+    baseline_unstable: bool = False
     tail_n: float = 0.0
+
+    # Where the integration window opens. Normally T0, but pulled back when
+    # the motor was already producing thrust before the fire command.
+    t_analysis_start: float = 0.0
+    thrust_before_t0: bool = False
 
     # --- ignition timing ---
     t_first_motion: float = float("nan")
@@ -96,6 +103,62 @@ def _first_time_above(t: np.ndarray, y: np.ndarray, level: float,
     return float(t[i - 1] + frac * (t[i] - t[i - 1]))
 
 
+def _curve_frame(t: np.ndarray, thrust: np.ndarray, baseline: np.ndarray) -> pd.DataFrame:
+    """The plotting series, always with the same four columns.
+
+    Every `return` out of analyze() goes through here. The early-out paths
+    used to build this frame with only some of the columns, and the chart
+    code - which reads `curve["baseline"]` unconditionally - then died with
+    a KeyError on the first odd burn and took the whole batch down with it.
+    """
+    return pd.DataFrame({
+        "t": t,
+        "thrust": thrust,
+        "net": thrust - baseline,
+        "baseline": baseline,
+    })
+
+
+def _robust_baseline(f: np.ndarray) -> tuple[float, float, int]:
+    """Resting level and noise from a pre-roll that may not be quiet.
+
+    The pre-roll is *supposed* to be the motor sitting still, but it is not
+    always: a motor that lights before the command, someone steadying the
+    stand, a cable still being dressed - any of that lands in the window.
+    A plain mean/std then reports a resting level metres from the truth and
+    a noise figure tens of times too large, and everything downstream (the
+    ignition threshold, the "did it light?" guard) is derived from those
+    two numbers. One real burn on this stand lit ~1 s before T0 and was
+    thrown away entirely as "no thrust above the noise floor" because of it.
+
+    So: centre on the median and measure spread with the MAD, both of which
+    survive a contaminated minority, then drop the samples that sit far from
+    that centre and recompute on what is left.
+
+    Returns (level, noise as a standard deviation, samples rejected).
+    """
+    med = float(np.median(f))
+    mad = float(np.median(np.abs(f - med)))
+    sigma = 1.4826 * mad          # MAD -> sigma, for normally distributed noise
+    if not (sigma > 0):
+        # Perfectly flat or heavily quantised: fall back to the plain spread.
+        sigma = float(np.std(f))
+    if not (sigma > 0):
+        return med, 0.0, 0
+
+    keep = np.abs(f - med) <= 4.0 * sigma
+    # Refuse to throw away most of the window - if that much of it is
+    # "outlying" the assumption behind this whole routine is wrong, and a
+    # noisy honest answer beats a confident one from five samples.
+    if keep.sum() < max(5, int(0.2 * f.size)):
+        keep = np.ones(f.size, dtype=bool)
+
+    kept = f[keep]
+    level = float(np.mean(kept))
+    noise = float(np.std(kept, ddof=1)) if kept.size > 1 else 0.0
+    return level, noise, int((~keep).sum())
+
+
 def _last_time_above(t: np.ndarray, y: np.ndarray, level: float) -> float:
     idx = np.nonzero(y >= level)[0]
     if idx.size == 0:
@@ -159,11 +222,12 @@ def analyze(burn: Burn, prop_mass_g: float | None = None,
     # about to click and people are usually still moving around the stand.
     pre = df[df["t"] < -0.10]
     if len(pre) >= 5:
-        r.baseline_n = float(pre["thrust"].mean())
-        r.baseline_noise_rms = float(pre["thrust"].std(ddof=1))
+        pre_f = pre["thrust"].to_numpy(dtype=float)
+        r.baseline_n, r.baseline_noise_rms, r.baseline_rejected = _robust_baseline(pre_f)
         r.baseline_samples = len(pre)
-        if len(pre) >= 20:
-            slope = np.polyfit(pre["t"].to_numpy(), pre["thrust"].to_numpy(), 1)[0]
+        kept = np.abs(pre_f - r.baseline_n) <= max(5 * r.baseline_noise_rms, 1e-9)
+        if kept.sum() >= 20:
+            slope = np.polyfit(pre["t"].to_numpy()[kept], pre_f[kept], 1)[0]
             r.baseline_drift_n_per_s = float(slope)
     else:
         pre0 = df[df["t"] < 0]
@@ -172,7 +236,42 @@ def analyze(burn: Burn, prop_mass_g: float | None = None,
         r.baseline_samples = len(pre0)
         r.warnings.append("very short pre-roll - the baseline is uncertain")
 
-    post = df[df["t"] >= 0]
+    # ---- is the resting level believable at all? ---------------------------
+    # Thrust only ever pushes one way, so a pre-roll that is genuinely at
+    # rest scatters symmetrically about the baseline. A cluster sitting well
+    # BELOW it means the estimate got dragged upwards - the median only
+    # survives contamination up to half the window, and a motor burning
+    # through most of the pre-roll takes it past that. Nothing in the record
+    # can resolve which level is the real one, so this is reported rather
+    # than guessed at.
+    if len(pre) >= 30 and r.baseline_noise_rms > 0:
+        below = int(np.sum(pre_f < r.baseline_n - max(6 * r.baseline_noise_rms, 0.2)))
+        if below > 0.05 * len(pre):
+            r.baseline_unstable = True
+
+    # ---- was the motor already running before the command? ----------------
+    # If a slice of the pre-roll sits well clear of the resting level, thrust
+    # started before T0. The record is still perfectly good - it just cannot
+    # be read as "everything happens after the command", so the integration
+    # window opens where the thrust actually starts instead of at T0.
+    detect_level = max(detect_sigma * r.baseline_noise_rms,
+                       0.02 * float(np.max(f) - r.baseline_n), 0.05)
+    early = pre[pre["thrust"] - r.baseline_n >= detect_level] if len(pre) >= 5 else pre[:0]
+    if len(early) >= 3:
+        r.thrust_before_t0 = True
+        r.t_analysis_start = float(early["t"].iloc[0])
+        r.warnings.append(
+            f"thrust was already present {abs(r.t_analysis_start):.2f} s BEFORE the fire "
+            "command - the motor lit early, so every time measured from T0 (ignition "
+            "delay, rise times) is meaningless here; impulse and peak are still valid")
+
+    if r.baseline_unstable and not r.thrust_before_t0:
+        r.warnings.append(
+            "the stand was never at rest during the pre-roll - the resting level "
+            f"({r.baseline_n:.2f} N) is a guess and every figure below is suspect. "
+            "A motor already burning through the whole pre-roll looks like this.")
+
+    post = df[df["t"] >= r.t_analysis_start]
     if post.empty:
         r.warnings.append("no data after T0")
         return r
@@ -184,7 +283,7 @@ def analyze(burn: Burn, prop_mass_g: float | None = None,
     r.peak_thrust = float(np.max(net))
     if r.peak_thrust <= max(5 * r.baseline_noise_rms, 0.1):
         r.warnings.append("no thrust found above the noise floor - did the motor light?")
-        r.curve = pd.DataFrame({"t": tp, "net": net})
+        r.curve = _curve_frame(tp, fp, np.full(tp.size, r.baseline_n))
         return r
 
     i_peak = int(np.argmax(net))
@@ -261,12 +360,12 @@ def analyze(burn: Burn, prop_mass_g: float | None = None,
     # reading drops. The shift between T0 and burnout is interpolated
     # against the impulse already delivered rather than linearly in time -
     # propellant does not leave at a constant rate.
-    mask = (tp >= 0) & (tp <= t5_fall)
+    mask = (tp >= r.t_analysis_start) & (tp <= t5_fall)
     tb = tp[mask]
     fb = fp[mask]
     if tb.size < 3:
         r.warnings.append("too few samples inside the burn window")
-        r.curve = pd.DataFrame({"t": tp, "net": net})
+        r.curve = _curve_frame(tp, fp, np.full(tp.size, r.baseline_n))
         return r
 
     rough = np.maximum(fb - r.baseline_n, 0.0)
@@ -330,14 +429,15 @@ def analyze(burn: Burn, prop_mass_g: float | None = None,
         r.motor_designation = f"{cls}{r.avg_thrust:.0f}"
 
     # ---- series for the plots ----------------------------------------------
-    r.curve = pd.DataFrame({
-        "t": tp,
-        "thrust": fp,
-        "net": net,
-        "baseline": np.interp(tp, tb, baseline_curve, left=r.baseline_n, right=r.tail_n),
-    })
+    r.curve = _curve_frame(
+        tp, fp, np.interp(tp, tb, baseline_curve, left=r.baseline_n, right=r.tail_n))
 
     # ---- sanity checks ------------------------------------------------------
+    if r.baseline_rejected:
+        pct = 100.0 * r.baseline_rejected / max(1, r.baseline_samples)
+        r.warnings.append(
+            f"{r.baseline_rejected} of {r.baseline_samples} pre-roll samples ({pct:.0f} %) "
+            "were not at rest and were left out of the baseline")
     if not math.isnan(r.t_first_motion) and r.t_first_motion > 2.0:
         r.warnings.append(f"very long ignition delay ({r.t_first_motion:.2f} s) - "
                           "check the igniter and the pyrogen")
@@ -401,6 +501,8 @@ def summary_rows(burn: Burn, r: Result) -> list[tuple[str, str]]:
         ("Resting reading before the burn", fmt(r.baseline_n, " N", 3)),
         ("Resting reading after the burn", fmt(r.tail_n, " N", 3)),
         ("Baseline noise (RMS)", fmt(r.baseline_noise_rms, " N", 4)),
+        ("Pre-roll samples not at rest", f"{r.baseline_rejected} of {r.baseline_samples}"),
+        ("Integration window opens at", fmt(r.t_analysis_start, " s")),
         ("Baseline drift", fmt(r.baseline_drift_n_per_s, " N/s", 4)),
         ("Largest gap between samples", fmt(r.max_gap_s * 1000.0, " ms", 1)),
     ]

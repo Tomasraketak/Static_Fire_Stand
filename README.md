@@ -467,8 +467,36 @@ The chart sheet has five panels:
 | Record quality | interval between samples — flat is good, spikes are dropouts |
 
 **Read the warnings.** When something is off — record cut short, load
-cell saturated, mass loss unmeasurable, motor still burning at the end —
-the script says so instead of printing a confident wrong number.
+cell saturated, mass loss unmeasurable, motor still burning at the end,
+the stand not at rest before the command — the script says so instead of
+printing a confident wrong number. They are printed to the console, shown
+under the charts, and written into both `burn_XXX_summary.csv` and the
+`.xlsx`.
+
+**A burn that fails to analyse no longer costs you the others.** Each
+burn is written to its own folder independently, so one odd record is
+reported and skipped while the rest of the download is still analysed in
+full.
+
+### If the motor lights before the fire command
+
+It happens — a hot igniter, a hangfire that catches during the countdown.
+The recorder is already running (the pre-roll opens 3 s before T0), so
+the burn *is* captured, and the analysis handles it:
+
+* the resting level and its noise are measured with a **median/MAD
+  estimator**, so thrust that has leaked into the pre-roll cannot drag the
+  baseline up or inflate the noise figure,
+* the integration window opens where the thrust actually starts rather
+  than at T0, so the impulse includes the part delivered before the
+  command,
+* everything timed from T0 — ignition delay, rise times — is flagged as
+  meaningless for that burn, because it is.
+
+Peak thrust, total impulse and burn time stay trustworthy. If the stand
+was never at rest during the whole pre-roll, the resting level cannot be
+recovered from the record at all and the analysis says so outright rather
+than reporting a number it cannot stand behind.
 
 ### 4.8 Reading old data
 
@@ -545,8 +573,16 @@ s           one thrust reading
 * NAR/TRA letter class and a designation like `H169`
 
 **Measurement quality** — sample rate, gaps, baseline noise and drift,
-ADC saturation, pages dropped on CRC, missing closing page, resumes after
-a restart.
+how much of the pre-roll was not at rest, ADC saturation, pages dropped
+on CRC, missing closing page, resumes after a restart.
+
+The resting level and its noise come from a **median/MAD estimator with
+sigma clipping**, not a plain mean and standard deviation. The pre-roll
+is only *supposed* to be quiet; when it is not — a motor that lit early,
+someone steadying the stand — a plain mean lands nowhere near the truth
+and the noise figure blows up by a factor of hundreds, which then feeds
+the ignition threshold and the "did it light?" check and throws away a
+perfectly good burn.
 
 ---
 
