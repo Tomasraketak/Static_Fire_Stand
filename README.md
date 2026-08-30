@@ -68,7 +68,11 @@ If the journal says a burn was live when the stand booted, the firmware:
 * 4 s hardware watchdog.
 * Countdown aborts on: RBF key inserted, button, ABORT in the web UI,
   load cell failure.
-* The physical button must be **held** for 750 ms; a tap does nothing.
+* The physical button must be **held** for 500 ms; a tap does nothing.
+  Once it triggers it is ignored completely for 2 s and then has to be
+  released before it counts again, so the press that starts a countdown
+  cannot also abort it. (ABORT in the web UI and the RBF key are never
+  deaf — they stop the sequence at any moment.)
 * The web code is compared in constant time, with a one-minute lockout
   after 5 wrong attempts.
 
@@ -132,6 +136,36 @@ cell keeps converting on its own clock the whole time core 0 is stalled.
 So core 1 stays off the network for the recording window instead,
 trading a frozen page for a clean record. It catches up immediately once
 the burn closes. Data integrity always wins over the live view.
+
+### Dodging the sample dropouts
+
+Something on this board stalls core 0 for a few hundred milliseconds at a
+time. Gating the web server off during recording (above) roughly halved
+it, but did not remove it — measured burns still showed dropouts of
+~320 ms. They repeat on their **own clock** (~7.45 s on the stand this was
+measured on), free-running rather than in step with anything the sequence
+does, so where one lands in a burn is pure luck. When one lands in the
+first seconds it eats ~30 samples right where the thrust curve matters.
+
+They cannot be prevented from here, so the firmware dodges them instead:
+
+* it **times its own sampling** — a gap far past the nominal 10.7 ms means
+  core 0 was blocked, whatever did it — and learns the repeat period,
+* when a countdown starts, it picks a **countdown length** that puts
+  `T0 .. T0+4 s` between two stalls, stretching it by up to 8 s,
+* the choice is made **once, before the countdown starts**, so the counter
+  the operator watches is the adjusted one. It counts down to the real T0
+  and hits zero at ignition — ignition is never late relative to what is
+  displayed.
+
+A dodge is only ever attempted once a stable period has actually been
+measured recently; otherwise the countdown is exactly `COUNTDOWN_MS` as
+before. The web UI's **Dropout dodge** row shows whether the pattern has
+been learned, and `i` / `--info` report the measured period. Set
+`STALL_AVOIDANCE` to `0` in `config.h` to turn the whole thing off.
+
+> This treats the symptom, not the cause. If you find and fix whatever is
+> stalling core 0, turn it off.
 
 ---
 
@@ -367,7 +401,11 @@ Run through this at the bench, before anything is live:
    `OUT / ARMED`, and the FIRE button becomes clickable.
 8. **Confirm everyone is clear.** Call it out loud.
 9. **Type the code and press START COUNTDOWN.** Confirm the dialog.
-10. **The countdown runs for 15 s.** The pixel blinks red, faster as T0
+10. **The countdown runs for 15 s** — sometimes a little longer, up to
+    about 20 s, see [dropout dodging](#dodging-the-sample-dropouts) below.
+    Either way the displayed counter always counts down to the real T0 and
+    reaches zero exactly at ignition; nothing fires after the counter has
+    run out. The pixel blinks red, faster as T0
     approaches, and the web page counts down `T-14.3 s`. The recorder
     opens 3 s before T0 and starts banking baseline samples - **the page
     freezes at that point and stays quiet until the burn closes**, on
