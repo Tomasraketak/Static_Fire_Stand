@@ -175,9 +175,20 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
         if _ok(r.t_first_motion):
             ax.axvline(r.t_first_motion, color=C_IMPULSE, linewidth=1.6, zorder=3)
 
+        # The igniter blip, if one was set aside. Drawn so the decision can
+        # be checked by eye rather than taken on trust.
+        if _ok(r.t_igniter_spike):
+            ax.plot([r.t_igniter_spike], [r.igniter_spike_n], "x", markersize=9,
+                    markeredgewidth=2.0, color=C_MUTED, zorder=6)
+            ax.annotate("igniter", xy=(r.t_igniter_spike, r.igniter_spike_n),
+                        xytext=(6, 4), textcoords="offset points",
+                        color=C_MUTED, fontsize=8)
+
         # The thresholds sit tens of milliseconds apart, so labels next to
         # each line would overlap; they go into one block instead.
         lines = []
+        if _ok(r.t_igniter_spike):
+            lines.append(f"igniter blip  {r.t_igniter_spike*1000:7.0f} ms")
         if _ok(r.t_first_motion):
             lines.append(f"first motion  {r.t_first_motion*1000:7.0f} ms")
         for pct in (10, 50, 90):

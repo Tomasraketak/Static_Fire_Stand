@@ -592,6 +592,27 @@ s           one thrust reading
 * rise time 10 → 90 %, steepest rise in N/s
 * when the pyro channel opened
 
+**The igniter's own kick is not counted as the burn starting.** An igniter
+can knock the load cell about — the charge going off, the leads twitching
+— a good second before the grain itself catches, and that is real thrust
+no threshold will reject. Taken at face value it puts the ignition delay a
+second early and stretches the rise time across the dead space in between.
+A blip is set aside as the igniter, not the burn, when all three hold:
+
+| | |
+|---|---|
+| small | at most 25 % of peak thrust |
+| brief | lasting no more than 500 ms |
+| separated | at least 200 ms of quiet before the burn proper |
+
+Anything that fails one of those — a big kick, a long one, or a shoulder
+that runs continuously into the main rise — is left alone and treated as
+part of the burn. Nothing is thrown away: the blip is drawn on the
+ignition close-up marked `igniter`, listed in the summary, and the
+analysis says in its warnings that it moved the start, so the call can be
+checked by eye. Impulse is unaffected either way — it is still integrated
+over the whole window.
+
 **Thrust curve:**
 
 * peak thrust and when it occurred, peak-to-average ratio
