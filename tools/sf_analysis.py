@@ -17,6 +17,17 @@ from sf_protocol import G0, Burn
 # fractions of peak thrust that get a reported rise and decay time
 PCT_STEPS = (5, 10, 25, 50, 75, 90, 95, 100)
 
+# An igniter can give the load cell a kick of its own - the charge going off,
+# the leads twitching - a good second before the grain itself catches. It is
+# real thrust, so no threshold rejects it, and taking it as the start of the
+# burn puts the ignition delay a second early and stretches the rise time
+# across the dead space in between. A blip is treated as the igniter, not the
+# burn, when all three of these hold: it is small, it is brief, and the stand
+# went quiet again afterwards.
+IGNITER_SPIKE_MAX_FRAC = 0.25   # at most this much of peak thrust
+IGNITER_SPIKE_MAX_S    = 0.50   # lasting no longer than this
+IGNITER_SPIKE_GAP_S    = 0.20   # with at least this much quiet before the burn
+
 
 @dataclass
 class Result:
@@ -43,6 +54,8 @@ class Result:
     t_peak: float = float("nan")
     rise_10_90: float = float("nan")
     detection_threshold_n: float = 0.0
+    t_igniter_spike: float = float("nan")   # blip before the burn, if any
+    igniter_spike_n: float = 0.0
     t_pyro_off: float = float("nan")
     pyro_on_duration: float = float("nan")
     pct_times: dict = field(default_factory=dict)
@@ -101,6 +114,53 @@ def _first_time_above(t: np.ndarray, y: np.ndarray, level: float,
         return float(t[i])
     frac = (level - y0) / (y1 - y0)
     return float(t[i - 1] + frac * (t[i] - t[i - 1]))
+
+
+def _runs(mask: np.ndarray, min_len: int = 3) -> list[tuple[int, int]]:
+    """Contiguous [start, end) stretches where mask is true, min_len or longer.
+
+    Requiring a few samples in a row is what stops a single noisy sample
+    being mistaken for the motor doing something.
+    """
+    if mask.size == 0:
+        return []
+    edges = np.diff(mask.astype(np.int8))
+    starts = list(np.nonzero(edges == 1)[0] + 1)
+    ends = list(np.nonzero(edges == -1)[0] + 1)
+    if mask[0]:
+        starts.insert(0, 0)
+    if mask[-1]:
+        ends.append(mask.size)
+    return [(a, b) for a, b in zip(starts, ends) if b - a >= min_len]
+
+
+def _main_burn_start(t: np.ndarray, net: np.ndarray, thr: float,
+                     i_peak: int, peak: float) -> tuple[int, int | None]:
+    """Index where the burn proper starts, and the igniter blip before it.
+
+    Walks back from the run of samples containing the peak and keeps
+    absorbing earlier runs as part of the same event, stopping at the first
+    one that looks like the igniter firing on its own: small, brief, and
+    followed by a quiet stretch. Returns (burn start index, index of the
+    peak of the rejected blip or None).
+    """
+    runs = _runs(net >= thr, min_len=3)
+    if not runs:
+        return 0, None
+
+    main = next((k for k, (a, b) in enumerate(runs) if a <= i_peak < b), 0)
+    start = main
+    for k in range(main - 1, -1, -1):
+        a, b = runs[k]
+        gap = float(t[runs[start][0]] - t[b - 1])
+        amp = float(np.max(net[a:b]))
+        dur = float(t[b - 1] - t[a])
+        if (amp <= IGNITER_SPIKE_MAX_FRAC * peak
+                and dur <= IGNITER_SPIKE_MAX_S
+                and gap >= IGNITER_SPIKE_GAP_S):
+            return runs[start][0], a + int(np.argmax(net[a:b]))
+        start = k
+    return runs[start][0], None
 
 
 def _curve_frame(t: np.ndarray, thrust: np.ndarray, baseline: np.ndarray) -> pd.DataFrame:
@@ -318,19 +378,22 @@ def analyze(burn: Burn, prop_mass_g: float | None = None,
     thr = max(detect_sigma * r.baseline_noise_rms,
               detect_floor_pct / 100.0 * r.peak_thrust)
     r.detection_threshold_n = float(thr)
-    above = net >= thr
-    run = np.convolve(above.astype(int), np.ones(3, dtype=int), mode="valid")
-    hit = np.nonzero(run == 3)[0]
-    if hit.size:
-        i0 = int(hit[0])
-        r.t_first_motion = _first_time_above(tp, net, thr, start_idx=max(0, i0 - 2))
-    else:
-        r.t_first_motion = _first_time_above(tp, net, thr)
+    # Where the burn proper begins - which is not necessarily the first
+    # thing that moved the cell. See _main_burn_start().
+    i_burn, i_spike = _main_burn_start(tp, net, thr, i_peak, r.peak_thrust)
+    if i_spike is not None:
+        r.t_igniter_spike = float(tp[i_spike])
+        r.igniter_spike_n = float(net[i_spike])
+
+    r.t_first_motion = _first_time_above(tp, net, thr, start_idx=i_burn)
 
     # ---- rise and decay thresholds ---------------------------------------
+    # Measured from the start of the burn, so an igniter blip cannot claim
+    # the 5 % and 10 % crossings and stretch the rise time across the pause
+    # between it and the grain lighting.
     for pct in PCT_STEPS:
         lvl = r.peak_thrust * pct / 100.0
-        r.pct_times[pct] = _first_time_above(tp, net, lvl)
+        r.pct_times[pct] = _first_time_above(tp, net, lvl, start_idx=i_burn)
         r.decay_times[pct] = _last_time_above(tp, net, lvl)
 
     t5_rise = r.pct_times.get(5, float("nan"))
@@ -438,6 +501,13 @@ def analyze(burn: Burn, prop_mass_g: float | None = None,
         r.warnings.append(
             f"{r.baseline_rejected} of {r.baseline_samples} pre-roll samples ({pct:.0f} %) "
             "were not at rest and were left out of the baseline")
+    if not math.isnan(r.t_igniter_spike):
+        r.warnings.append(
+            f"a {r.igniter_spike_n:.1f} N blip at {r.t_igniter_spike*1000:.0f} ms "
+            f"({r.igniter_spike_n / r.peak_thrust * 100:.0f} % of peak) was read as the "
+            f"igniter firing, not the grain lighting - the burn is timed from "
+            f"{r.t_first_motion*1000:.0f} ms instead. Check the ignition close-up if "
+            "that looks wrong")
     if not math.isnan(r.t_first_motion) and r.t_first_motion > 2.0:
         r.warnings.append(f"very long ignition delay ({r.t_first_motion:.2f} s) - "
                           "check the igniter and the pyrogen")
@@ -466,6 +536,8 @@ def summary_rows(burn: Burn, r: Result) -> list[tuple[str, str]]:
         ("- IGNITION TIMING -", ""),
         ("T0 (fire command)", "0.000 s"),
         ("Detection threshold", fmt(r.detection_threshold_n, " N")),
+        ("Igniter blip (ignored)", fmt(r.t_igniter_spike, " s")),
+        ("Igniter blip size", fmt(r.igniter_spike_n, " N", 2) if r.igniter_spike_n else "-"),
         ("First motion (ignition delay)", fmt(r.t_first_motion, " s")),
         ("Reached 5 % of peak", fmt(r.pct_times.get(5), " s")),
         ("Reached 10 % of peak", fmt(r.pct_times.get(10), " s")),
