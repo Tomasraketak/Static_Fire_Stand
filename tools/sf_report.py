@@ -96,21 +96,33 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
     fig.text(0.045, 0.958, _info_line(burn, r), color=C_INK2, fontsize=11,
              ha="left", va="top")
 
-    # The record is normally much longer than the burn, so the charts are
-    # cropped around the interesting part - otherwise the curve would be a
-    # thin spike at the edge of the picture.
+    # The record is much longer than the burn, so the charts are cropped
+    # around it. The window is framed on where the thrust actually is, with
+    # a margin proportional to how long it lasted.
+    #
+    # It used to be a multiple of burn_time, which is measured from the fire
+    # command - so a motor that took two seconds to light was given two extra
+    # seconds of empty trace at the END, while the left edge sat at the start
+    # of the pre-roll regardless. A burn could end up filling a third of its
+    # own chart, padded with flat line on both sides.
     t_min = float(df["t"].min())
     t_max = float(df["t"].max())
-    t_view = min(t_max, max(r.burn_time * 1.6, r.burn_time + 2.0)) if r.burn_time > 0 else t_max
-    clipped = t_view < t_max - 0.5
+    t_lo, t_hi = t_min, t_max
+    if r.burn_time > 0:
+        ev_lo = min(0.0, r.t_first_motion if _ok(r.t_first_motion) else 0.0)
+        ev_hi = r.burn_time                       # thrust back down through 5 %
+        span_s = max(ev_hi - ev_lo, 0.5)
+        t_lo = max(t_min, ev_lo - min(max(0.10 * span_s, 0.3), 1.5))
+        t_hi = min(t_max, ev_hi + min(max(0.15 * span_s, 0.5), 2.0))
+    clipped = t_lo > t_min + 0.05 or t_hi < t_max - 0.05
 
     # ---- 1) the whole thrust curve ------------------------------------
     ax = fig.add_subplot(gs[0, :])
     _style(ax, "Time from fire command [s]", "Thrust [N]",
-           "Thrust curve" + (f"  (record continues to {t_max:.0f} s)" if clipped else ""))
+           "Thrust curve" + (f"  (record runs {t_min:.0f} to {t_max:.0f} s)" if clipped else ""))
 
     if not r.curve.empty:
-        span = df.loc[df["t"] <= t_view, "thrust"]
+        span = df.loc[(df["t"] >= t_lo) & (df["t"] <= t_hi), "thrust"]
         lo, hi = float(span.min()), float(span.max())
         pad = max(0.05 * (hi - lo), 0.5)
 
@@ -136,9 +148,13 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
         if _ok(r.t_peak):
             ax.plot([r.t_peak], [r.baseline_n + r.peak_thrust], "o", markersize=9,
                     color=C_CRIT, markeredgecolor=C_SURFACE, markeredgewidth=2, zorder=6)
+            # Flip the label to the inside when the peak sits near the right
+            # edge, where it would otherwise run into the legend.
+            frac = (r.t_peak - t_lo) / max(t_hi - t_lo, 1e-9)
+            dx, ha = (-12, "right") if frac > 0.6 else (12, "left")
             ax.annotate(f"peak {r.peak_thrust:.1f} N  @ {r.t_peak:.2f} s",
                         xy=(r.t_peak, r.baseline_n + r.peak_thrust),
-                        xytext=(12, 2), textcoords="offset points",
+                        xytext=(dx, 2), textcoords="offset points", ha=ha,
                         color=C_INK, fontsize=10, fontweight="600", va="center")
         if _ok(r.t_first_motion):
             ax.plot([r.t_first_motion], [r.baseline_n + r.detection_threshold_n], "o",
@@ -149,7 +165,7 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
                         xytext=(10, 12), textcoords="offset points",
                         color=C_INK2, fontsize=9)
 
-        ax.set_xlim(t_min, t_view)
+        ax.set_xlim(t_lo, t_hi)
         ax.set_ylim(lo - pad, hi + pad * 2.2)
         leg = ax.legend(loc="upper right", frameon=False, fontsize=9)
         for txt in leg.get_texts():
@@ -158,22 +174,44 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
     # ---- 2) ignition close-up ------------------------------------------
     ax = fig.add_subplot(gs[1, 0])
     _style(ax, "Time from fire command [s]", "Thrust above rest [N]", "Ignition close-up")
-    zoom_hi = max(0.6, (r.t_peak * 1.7) if _ok(r.t_peak) else 0.6)
-    z = df[(df["t"] >= -0.25) & (df["t"] <= zoom_hi)]
+    # Framed on the rise itself - first motion to peak, plus margin - so it
+    # is actually a close-up. It used to end at 1.7x the time of the peak,
+    # which counts from the fire command: a motor that lit two seconds late
+    # got a five second "close-up" in which the rise was a tenth of the
+    # width. The command line is worth having in view, so it is included
+    # whenever the motor lit within a second of it; past that the delay is
+    # better read off the main chart and the figures on the left.
+    ev0 = r.t_first_motion if _ok(r.t_first_motion) else 0.0
+    ev1 = r.t_peak if _ok(r.t_peak) and r.t_peak > ev0 else ev0 + 0.3
+    rise = max(ev1 - ev0, 0.15)
+    zoom_lo = ev0 - min(max(0.30 * rise, 0.10), 0.60)
+    zoom_hi = ev1 + min(max(0.60 * rise, 0.20), 1.20)
+    if ev0 <= 1.0:
+        zoom_lo = min(zoom_lo, -0.15)   # keep T0 in shot for a prompt light
+    if _ok(r.t_igniter_spike):
+        # A rejected blip belongs in the ignition panel - it is the whole
+        # reason the burn is timed from where it is, and this is where the
+        # call gets checked.
+        zoom_lo = min(zoom_lo, r.t_igniter_spike - 0.15)
+    z = df[(df["t"] >= zoom_lo) & (df["t"] <= zoom_hi)]
     if len(z):
         ax.plot(z["t"], z["thrust"] - r.baseline_n, color=C_THRUST, linewidth=2.0,
                 marker="o", markersize=3.2, markeredgewidth=0, zorder=4)
         ax.axhline(r.detection_threshold_n, color=C_MUTED, linewidth=1.0,
                    linestyle=(0, (2, 3)), zorder=3)
-        ax.axvline(0, color=C_CRIT, linewidth=1.4, zorder=3)
-        ax.annotate("command", xy=(0, ax.get_ylim()[0]), xytext=(4, 6),
-                    textcoords="offset points", color=C_CRIT, fontsize=9, va="bottom")
+        # Only when it is inside the window: an axvline outside it drags the
+        # autoscale back out and undoes the framing above.
+        if zoom_lo <= 0.0 <= zoom_hi:
+            ax.axvline(0, color=C_CRIT, linewidth=1.4, zorder=3)
+            ax.annotate("command", xy=(0, ax.get_ylim()[0]), xytext=(4, 6),
+                        textcoords="offset points", color=C_CRIT, fontsize=9, va="bottom")
         for pct in (10, 50, 90):
             tv = r.pct_times.get(pct)
-            if _ok(tv) and tv <= zoom_hi:
+            if _ok(tv) and zoom_lo <= tv <= zoom_hi:
                 ax.axvline(tv, color=C_MUTED, linewidth=0.9, linestyle=(0, (1, 3)), zorder=2)
-        if _ok(r.t_first_motion):
+        if _ok(r.t_first_motion) and zoom_lo <= r.t_first_motion <= zoom_hi:
             ax.axvline(r.t_first_motion, color=C_IMPULSE, linewidth=1.6, zorder=3)
+        ax.set_xlim(zoom_lo, zoom_hi)
 
         # The igniter blip, if one was set aside. Drawn so the decision can
         # be checked by eye rather than taken on trust.
@@ -232,7 +270,7 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
         # Starts where the integration does, which is before T0 when the
         # motor lit early - clipping at 0 there would draw the curve already
         # part way up and make it look like impulse appeared from nowhere.
-        ax.set_xlim(min(0.0, float(t[0])), t_view)
+        ax.set_xlim(min(t_lo, float(t[0])), t_hi)
         if _ok(r.t_half_impulse):
             ax.plot([r.t_half_impulse], [np.interp(r.t_half_impulse, t, cum)], "o",
                     markersize=8, color=C_INK, markeredgecolor=C_SURFACE,
@@ -241,7 +279,7 @@ def plot_burn(burn: Burn, r: Result, outdir: Path, show: bool = False) -> Path:
                         xy=(r.t_half_impulse, np.interp(r.t_half_impulse, t, cum)),
                         xytext=(8, -22), textcoords="offset points",
                         color=C_INK2, fontsize=9)
-        ax.annotate(f"{r.total_impulse:.1f} N.s total", xy=(t_view, cum[-1]),
+        ax.annotate(f"{r.total_impulse:.1f} N.s total", xy=(t_hi, cum[-1]),
                     xytext=(-6, -14), textcoords="offset points", ha="right",
                     color=C_INK, fontsize=10, fontweight="600")
 

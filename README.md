@@ -499,10 +499,20 @@ The chart sheet has five panels:
 | Panel | What to look at |
 |---|---|
 | Thrust curve | the whole burn, with the pyro window, action time and the mass-loss correction line |
-| Ignition close-up | the delay from command to first motion, and the rise thresholds |
+| Ignition close-up | first motion and the rise thresholds, close up |
 | Cumulative impulse | how the impulse accumulates; a straight ramp means a neutral grain |
 | Thrust build-up | percent of peak against time, in milliseconds |
 | Record quality | interval between samples — flat is good, spikes are dropouts |
+
+The record is 13 s long and the burn is rarely more than a few of them, so
+the top two panels crop to **where the thrust actually is** — the burn plus
+a margin that scales with how long it lasted. The full extent of the
+record is named in the panel title whenever anything was cropped away, and
+`Record quality` always shows all of it. The close-up frames the rise
+itself; it keeps the fire command in shot when the motor lit promptly, and
+when it did not, the delay is on the main panel and in the figures beside
+the curve instead of as an empty second of chart. If a blip was set aside
+as the igniter, the close-up always widens far enough to show it.
 
 **Read the warnings.** When something is off — record cut short, load
 cell saturated, mass loss unmeasurable, motor still burning at the end,
