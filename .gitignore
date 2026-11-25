@@ -12,3 +12,5 @@ __pycache__/
 build/
 *.elf
 *.uf2
+tests/link_proto_test
+tests/stub_syntax.o

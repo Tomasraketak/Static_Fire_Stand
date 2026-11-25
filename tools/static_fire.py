@@ -21,6 +21,7 @@ TWO WAYS TO RUN THIS
    python static_fire.py --calibrate 500     calibrate with a 500 g weight
    python static_fire.py --cal-factor 2291.9275  set the counts/N factor directly
    python static_fire.py --ignition 300      set the igniter on-time, in ms
+   python static_fire.py --link ariadna      let an Ariadna V2 fire the igniter (off = this stand)
    python static_fire.py --erase             wipe the stand's memory
 
 Results go to results/YYYYMMDD_HHMMSS/ next to this script, unless
@@ -553,6 +554,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ignition", type=int, metavar="MS",
                    help=f"set the igniter on-time in milliseconds "
                        f"(firmware default {DEFAULT_IGNITION_MS})")
+    p.add_argument("--link", choices=("off", "ariadna"),
+                   help="who fires the igniter: 'off' = this stand (default), "
+                       "'ariadna' = an Ariadna V2 over I2C. Restarts the stand.")
     p.add_argument("--info", action="store_true", help="print stand status and exit")
     return p
 
@@ -560,7 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
 def cli(args) -> int:
     # --- actions that never touch the analysis path --------------------
     if (args.erase or args.tare or args.calibrate is not None or args.cal_factor is not None
-            or args.ignition is not None or args.info):
+            or args.ignition is not None or args.link is not None or args.info):
         port = args.port or find_port()
         if not port:
             print("No serial port found.")
@@ -590,6 +594,8 @@ def cli(args) -> int:
             if args.ignition is not None:
                 stand.set_ignition_ms(args.ignition)
                 print(stand.drain(2.0).strip())
+            if args.link is not None:
+                print(stand.set_link_mode(args.link).strip())
             if args.erase:
                 if input("Erase ALL data on the stand? Type ERASE: ").strip() == "ERASE":
                     stand.erase()

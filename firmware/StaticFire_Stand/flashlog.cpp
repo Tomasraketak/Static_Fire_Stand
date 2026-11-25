@@ -92,6 +92,7 @@ bool FlashLog::begin() {
     _j.state            = SF_STATE_IDLE;
     _j.cal_counts_per_n = DEFAULT_CAL_COUNTS_PER_N;
     _j.ignition_ms      = DEFAULT_IGNITION_MS;
+    _j.link_mode        = LINK_MODE_DEFAULT;
     _jSector = 0;
     _jIndex  = 0;
     commitJournal();

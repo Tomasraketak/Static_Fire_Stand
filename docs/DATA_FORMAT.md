@@ -86,7 +86,9 @@ because the record does not end at rest.
 
 `magic`, `seq`, `crc32`, `total_burns`, `active_slot`, `state`,
 `boot_count`, `resume_count`, `cal_counts_per_n`, `tare_offset`,
-`slot_erased_mask`, 5 × reserved.
+`slot_erased_mask`, `ignition_ms`, `link_mode` (0 = standalone, 1 = Ariadna
+fires the igniter; every journal written before firmware 2.1 reads as 0),
+3 × reserved.
 
 Two sectors of 16 records each, written in sequence. When a sector fills:
 the *other* sector is erased, a new record with a higher `seq` is written

@@ -8,16 +8,22 @@
 //
 //  See docs/DATA_FORMAT.md for the on-flash and on-wire formats and
 //  README.md for wiring and the safety checklist.
+//
+//  Optional: Ariadna V2 link. With `link ariadna` the stand does not fire
+//  its own MOSFET; it tells Ariadna to fire at T0 and hands over the record
+//  afterwards. Standalone (the default) is unchanged. docs/ARIADNA_LINK.md.
 // =====================================================================
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Wire.h>
 #include <Adafruit_NeoPixel.h>
 #include <hardware/watchdog.h>
 
 #include "config.h"
 #include "hx711_fast.h"
 #include "flashlog.h"
+#include "sf_stand_link.h"
 
 // ---------------------------------------------------------------------
 //  State machine
@@ -30,6 +36,11 @@ enum StandState : uint32_t {
   ST_FAULT     = 4,
   ST_DUMPING   = 5,
 };
+
+static_assert((int)ST_IDLE == (int)SFL_ST_IDLE && (int)ST_COUNTDOWN == (int)SFL_ST_COUNTDOWN &&
+              (int)ST_RECORDING == (int)SFL_ST_RECORDING && (int)ST_DUMPING == (int)SFL_ST_DUMPING &&
+              (int)ST_FAULT == (int)SFL_ST_FAULT && (int)ST_BOOT == (int)SFL_ST_BOOT,
+              "StandState must match sf_link_proto.h");
 
 // Every cross-core variable is a single 32 bit word, so reads and writes
 // are atomic on Cortex-M and no lock is needed. Nothing wider is shared.
@@ -69,7 +80,7 @@ volatile uint32_t web_fails   = 0;
 volatile uint32_t web_lock_ms = 0;
 
 enum AbortReason : uint32_t {
-  AB_NONE = 0, AB_RBF, AB_BUTTON, AB_WEB, AB_CONT_LOSS, AB_SENSOR, AB_STORAGE, AB_RESET
+  AB_NONE = 0, AB_RBF, AB_BUTTON, AB_WEB, AB_CONT_LOSS, AB_SENSOR, AB_STORAGE, AB_RESET, AB_LINK
 };
 static const char *abortName(uint32_t r) {
   switch (r) {
@@ -80,9 +91,15 @@ static const char *abortName(uint32_t r) {
     case AB_SENSOR:    return "load cell fault";
     case AB_STORAGE:   return "storage fault";
     case AB_RESET:     return "unexpected reset";
+    case AB_LINK:      return "Ariadna not ready / link lost";
     default:           return "none";
   }
 }
+
+// The Ariadna link. Mode 0 (standalone) makes every use of it a no-op.
+// Named ariLink because <unistd.h> already owns `link`.
+static SfStandLink ariLink;
+static volatile uint32_t core0_ready = 0;   // setup() finished; core 1 may start the I2C slave
 
 HX711Fast scale;
 Adafruit_NeoPixel pixels(1, PIN_LED, NEO_GRB + NEO_KHZ800);
@@ -113,6 +130,13 @@ static bool     btnLatched    = false; // must be released before it counts agai
 static uint32_t lastLedUpdate = 0;
 static bool     dumping       = false;
 
+// Igniter continuity: this board's input, or - with Ariadna - what Ariadna
+// reports for its own pyro 1 (nothing at all if it is not talking).
+static inline bool contSense() {
+  if (ariLink.active()) return ariLink.ariadna_cont(millis()) != 0;
+  return digitalRead(PIN_CONT) == HIGH;
+}
+
 static inline float rawToN(int32_t raw) {
   if (calCountsPerN == 0.0f) return 0.0f;
   return (float)(raw - tareOffset) / calCountsPerN;
@@ -129,7 +153,11 @@ static void pyroSet(bool on) {
     if (digitalRead(PIN_RBF) == HIGH) return;
     if ((uint32_t)(micros() - t0_us) > IGNITION_MAX_MS * 1000UL) return;
   }
-  digitalWrite(PIN_IGNITION, on ? HIGH : LOW);
+  // With Ariadna the igniter is on Ariadna's pyro 1, not on this board:
+  // the gate stays LOW in every state, and `pyroOn` only marks the window
+  // in which Ariadna was told to fire (it is what the record's pyro flag
+  // and the analysis' "pyro window" are made of).
+  digitalWrite(PIN_IGNITION, (on && !ariLink.active()) ? HIGH : LOW);
   pyroOn = on;
   tlm_pyro = on ? 1 : 0;
 }
@@ -243,7 +271,7 @@ static bool serviceLoadCell() {
   if (flashLog.recording() && prerollOpen) {
     uint8_t f = 0;
     if (pyroOn)                     f |= SF_SF_PYRO;
-    if (digitalRead(PIN_CONT))      f |= SF_SF_CONT;
+    if (contSense())                f |= SF_SF_CONT;
     if (digitalRead(PIN_RBF))       f |= SF_SF_RBF;
     if (raw >= 0x7FFFFE || raw <= -0x7FFFFE) f |= SF_SF_SAT;
     flashLog.addSample((int32_t)(t_us - t0_us), raw, f);
@@ -295,7 +323,8 @@ static void printInfoJson() {
                 "\"cal_counts_per_n\":%.6f,\"tare\":%ld,\"log_ok\":%d,\"log_err\":\"%s\","
                 "\"preroll_ms\":%lu,\"recording_ms\":%lu,\"ignition_ms\":%lu,"
                 "\"countdown_ms\":%lu,\"state\":%lu,\"batt_mV\":%ld,"
-                "\"stall_count\":%lu,\"stall_period_ms\":%lu,\"stall_agree\":%u}\n",
+                "\"stall_count\":%lu,\"stall_period_ms\":%lu,\"stall_agree\":%u,"
+                "\"link_mode\":%lu,\"link_ok\":%d,\"ariadna_ready\":%d,\"ariadna_armed\":%d}\n",
                 FW_VERSION,
                 (unsigned long)flashLog.journal().boot_count,
                 (unsigned long)flashLog.journal().resume_count,
@@ -310,7 +339,10 @@ static void printInfoJson() {
                 (unsigned long)ignitionMs, (unsigned long)countdownMs,
                 (unsigned long)state, (long)tlm_batt_mV,
                 (unsigned long)stallCount, (unsigned long)stallPeriodMs,
-                (unsigned)stallAgree);
+                (unsigned)stallAgree,
+                (unsigned long)ariLink.mode, ariLink.ariadna_alive(millis()) ? 1 : 0,
+                ariLink.ariadna_ready(millis()) ? 1 : 0,
+                ariLink.ariadna_armed(millis()) ? 1 : 0);
 }
 
 // Dumps raw 256 byte pages as base64, one line per page. Every page
@@ -361,6 +393,9 @@ static void printHelp() {
   Serial.println(F("  d          erase all burn data"));
   Serial.println(F("  abort      abort the current countdown"));
   Serial.println(F("  s          one-shot thrust reading"));
+  Serial.println(F("  link       show the Ariadna link mode"));
+  Serial.println(F("  link ariadna | off   who fires the igniter (takes effect after reboot)"));
+  Serial.println(F("  reboot     restart the stand (idle only)"));
 }
 
 static void abortSequence(uint32_t reason);
@@ -476,6 +511,29 @@ static void handleSerial() {
     flashLog.eraseAll();
     tlm_total_burns = 0;
     Serial.println("all burn data erased");
+  } else if (cmd == "link") {
+    Serial.printf("link mode: %s   Ariadna: %s\n",
+                  ariLink.active() ? "ariadna (Ariadna fires the igniter)" : "standalone (this board fires)",
+                  !ariLink.active() ? "not used"
+                  : ariLink.ariadna_ready(millis()) ? "ready"
+                  : ariLink.ariadna_alive(millis()) ? "talking, NOT ready" : "no link");
+  } else if (cmd.startsWith("link ")) {
+    if (state != ST_IDLE) { Serial.println("busy"); return; }
+    String m = cmd.substring(5); m.trim();
+    uint32_t want;
+    if (m == "ariadna") want = SFL_MODE_ARIADNA;
+    else if (m == "off" || m == "standalone") want = SFL_MODE_STANDALONE;
+    else { Serial.println("link ariadna | link off"); return; }
+    flashLog.journal().link_mode = want;
+    flashLog.commitJournal();
+    Serial.printf("link mode saved: %s. Type `reboot` to apply it.\n",
+                  want ? "ariadna - the stand will NOT fire its own igniter" : "standalone");
+  } else if (cmd == "reboot") {
+    if (state != ST_IDLE) { Serial.println("busy"); return; }
+    Serial.println("rebooting");
+    Serial.flush();
+    delay(100);
+    rp2040.reboot();
   } else if (cmd == "abort") {
     if (state == ST_COUNTDOWN) abortSequence(AB_WEB);
     Serial.println("abort requested");
@@ -507,8 +565,9 @@ static bool interlocksOk(uint32_t &why) {
   if (digitalRead(PIN_RBF) == HIGH)          { why = AB_RBF;     return false; }
   if (!flashLog.ok())                        { why = AB_STORAGE; return false; }
   if (!tlm_hx_ok)                            { why = AB_SENSOR;  return false; }
+  if (ariLink.active() && !ariLink.may_start(millis())) { why = AB_LINK; return false; }
 #if REQUIRE_CONTINUITY_TO_ARM
-  if (digitalRead(PIN_CONT) != HIGH)         { why = AB_CONT_LOSS; return false; }
+  if (!contSense())                          { why = AB_CONT_LOSS; return false; }
 #endif
   return true;
 }
@@ -520,7 +579,7 @@ static void openBurnFile() {
   SfHeaderPage h;
   memset(&h, 0, sizeof(h));
   h.boot_count       = flashLog.journal().boot_count;
-  h.fw_version       = (2u << 16) | (0u << 8) | 0u;
+  h.fw_version       = ((uint32_t)FW_MAJOR << 16) | ((uint32_t)FW_MINOR << 8);
   h.cal_counts_per_n = calCountsPerN;
   h.tare_offset      = tareOffset;
   h.preroll_ms       = PREROLL_MS;
@@ -545,6 +604,11 @@ static void closeBurn(bool clean) {
   flashLog.journal().total_burns = burnId;
   flashLog.commitJournal();
   tlm_total_burns = burnId;
+  if (ariLink.active()) {
+    // The record is complete and the slot will not be touched until it has
+    // been copied (the erase-ahead below waits for that).
+    ariLink.burn_closed(burnId, flashLog.validPages(burnSlot));
+  }
   Serial.printf("burn %lu closed: %lu samples, %s\n",
                 (unsigned long)burnId, (unsigned long)flashLog.sampleCount(),
                 clean ? "clean" : "TRUNCATED");
@@ -593,6 +657,25 @@ void setup() {
     tlm_boot_count   = flashLog.journal().boot_count;
     tlm_total_burns  = flashLog.journal().total_burns;
     tlm_resume_count = flashLog.journal().resume_count;
+  }
+
+  // ---- Ariadna link: the mode lives in the journal ----------------------
+  {
+    const uint32_t lm = (logOk && flashLog.journal().link_mode == SFL_MODE_ARIADNA)
+                            ? SFL_MODE_ARIADNA : SFL_MODE_STANDALONE;
+    ariLink.init(lm, FW_MAJOR, FW_MINOR);
+    ariLink.ignition_ms = ignitionMs;
+    ariLink.preroll_ms  = PREROLL_MS;
+    ariLink.recording_ms = RECORDING_MS;
+    if (lm && flashLog.journal().total_burns) {
+      // The last burn on the stand can be fetched by Ariadna on request
+      // (its `pull` command) even though nothing is "pending".
+      const uint32_t id = flashLog.journal().total_burns;
+      ariLink.burn_id = id;
+      ariLink.pages   = flashLog.validPages((id - 1) % flashLog.slotCount());
+    }
+    Serial.printf("link mode: %s\n", lm ? "ARIADNA - this board will not fire its igniter output"
+                                         : "standalone");
   }
 
   // Prime the sensor so tlm_hx_ok is meaningful before the first loop.
@@ -654,6 +737,24 @@ void setup() {
 
   rp2040.wdt_begin(WDT_TIMEOUT_MS);
   Serial.printf("Static Fire Stand %s ready. Type ? for help.\n", FW_VERSION);
+  core0_ready = 1;
+}
+
+// ---------------------------------------------------------------------
+//  Ariadna link: what core 0 tells the I2C interrupt about the stand.
+//  Called every loop, and again at T0 so IGNITE never goes out beside a
+//  stale state.
+// ---------------------------------------------------------------------
+static void publishLink() {
+  if (!ariLink.active()) return;
+  ariLink.abort_reason = tlm_last_abort;
+  ariLink.ignition_ms  = ignitionMs;
+  // Time left, taken fresh here (tlm_t_ms is from the previous pass): this is
+  // what Ariadna aligns its own clock to before T0, to within a millisecond.
+  const int32_t rem = (state == ST_COUNTDOWN)
+                          ? (int32_t)countdownMs - (int32_t)(millis() - t_state_entry) : 0;
+  ariLink.publish(state, tlm_hx_ok, tlm_log_ok, tlm_rbf ? 0 : 1, tlm_thrust_mN,
+                  rem, micros(), t0_us);
 }
 
 // ---------------------------------------------------------------------
@@ -665,10 +766,12 @@ void loop() {
   serviceLoadCell();
 
   const bool rbf  = (digitalRead(PIN_RBF)  == HIGH);
-  const bool cont = (digitalRead(PIN_CONT) == HIGH);
+  const bool cont = contSense();
   const bool btn  = (digitalRead(PIN_BTN)  == HIGH);
   tlm_rbf  = rbf ? 1 : 0;
   tlm_cont = cont ? 1 : 0;
+  publishLink();
+  if (ariLink.active()) ariLink.service(millis());
 
   // "Free" means "never written yet". slotIsReady() tracks something
   // different (pre-erased so the next countdown does not have to wait on
@@ -770,7 +873,8 @@ void loop() {
       // Keep the next slot pre-erased so the countdown never has to wait
       // on a 50 ms sector erase, and a burn can start instantly.
       uint32_t next = flashLog.journal().total_burns % flashLog.slotCount();
-      if (flashLog.ok() && !flashLog.slotIsReady(next)) {
+      const bool copying = ariLink.active() && ariLink.data_pending;
+      if (flashLog.ok() && !copying && !flashLog.slotIsReady(next)) {
         if (eraseSlotIdx != next) { eraseSlotIdx = next; eraseCursor = 0; }
         flashLog.eraseSlotStep(next, eraseCursor);
       } else {
@@ -785,6 +889,10 @@ void loop() {
           Serial.printf("COUNTDOWN started (%lu ms)\n", (unsigned long)countdownMs);
           tlm_last_abort = AB_NONE;
           resumedBurn = false;
+          if (ariLink.active()) {
+            const uint8_t seq = ariLink.countdown_start();
+            Serial.printf("Ariadna run #%u\n", (unsigned)seq);
+          }
           enterState(ST_COUNTDOWN);
         } else {
           Serial.printf("fire rejected: %s\n", abortName(why));
@@ -803,6 +911,10 @@ void loop() {
       if (req_abort)               { req_abort = 0; abortSequence(AB_WEB); break; }
       if (btnFire)                 { abortSequence(AB_BUTTON);    break; }
       if (!tlm_hx_ok)              { abortSequence(AB_SENSOR);    break; }
+      // Ariadna owns the igniter: if it drops out, or says it is not ready,
+      // there is nothing left to fire, so stop here rather than record a
+      // burn that cannot happen.
+      if (ariLink.active() && ariLink.must_abort(millis())) { abortSequence(AB_LINK); break; }
 #if ABORT_ON_CONT_LOSS
       if (!cont)                   { abortSequence(AB_CONT_LOSS); break; }
 #endif
@@ -832,7 +944,15 @@ void loop() {
         pyroOffUs = 0;
         pyroSet(true);
         pyroOnUs = micros();
-        Serial.println("T0 - IGNITION");
+        if (ariLink.active() && pyroOn) {
+          // Tell Ariadna now, before anything slow (the serial print).
+          // IGNITE first, the new state second: a status read in between
+          // then shows "countdown + ignite" (Ariadna waits one more poll)
+          // and never "recording without ignite".
+          ariLink.raise_ignite(millis());
+          publishLink();
+        }
+        Serial.println(ariLink.active() ? "T0 - IGNITE sent to Ariadna" : "T0 - IGNITION");
       }
       break;
     }
@@ -931,6 +1051,8 @@ const char html_page[] PROGMEM = R"rawliteral(
   <div class="row"><span>Continuity</span><span class="v" id="cont">--</span></div>
   <div class="row"><span>RBF key</span><span class="v" id="rbf">--</span></div>
   <div class="row"><span>Pyro channel</span><span class="v" id="pyro">--</span></div>
+  <div class="row" id="ariRow" style="display:none"><span>Ariadna</span><span class="v" id="ari">--</span></div>
+  <div class="row" id="ariPyroRow" style="display:none"><span>Ariadna pyro 1</span><span class="v" id="ariPyro">--</span></div>
   <div class="row"><span>Load cell</span><span class="v" id="hx">--</span></div>
   <div class="row"><span>Battery</span><span class="v" id="batt">--</span></div>
   <div class="row"><span>Storage</span><span class="v" id="log">--</span></div>
@@ -1002,9 +1124,12 @@ async function tick(){
   document.getElementById('timer').textContent =
     d.state==2 ? 'T-'+(d.t/1000).toFixed(1)+' s' :
     d.state==3 ? 'T+'+(d.t/1000).toFixed(1)+' s' : '--';
-  const c=document.getElementById('cont');c.textContent=d.cont?'OK':'OPEN';cls(c,d.cont?'ok':'crit');
+  const c=document.getElementById('cont');
+  if(d.link&&!d.lk_ok){c.textContent='no link to Ariadna';cls(c,'crit');}
+  else {c.textContent=(d.cont?'OK':'OPEN')+(d.link?' (Ariadna)':'');cls(c,d.cont?'ok':'crit');}
   const r=document.getElementById('rbf');r.textContent=d.rbf?'IN / SAFE':'OUT / ARMED';cls(r,d.rbf?'ok':'warn');
-  const p=document.getElementById('pyro');p.textContent=d.pyro?'LIVE':'off';cls(p,d.pyro?'crit':'ok');
+  const p=document.getElementById('pyro');
+  p.textContent=d.link?(d.pyro?'ARIADNA FIRING':'Ariadna'):(d.pyro?'LIVE':'off');cls(p,d.pyro?'crit':'ok');
   const x=document.getElementById('hx');x.textContent=d.hx?'OK':'FAULT';cls(x,d.hx?'ok':'crit');
   const b=document.getElementById('batt');
   if(d.batt_mV>=0){
@@ -1020,7 +1145,24 @@ async function tick(){
   document.getElementById('samples').textContent=d.samples;
   document.getElementById('burns').textContent=d.burns;
   document.getElementById('abort').textContent=d.abort;
-  document.getElementById('fireBtn').disabled=(d.state!=1)||d.rbf;
+  document.getElementById('fireBtn').disabled=(d.state!=1)||d.rbf||(d.link&&!d.lk_rdy);
+  // Only shown when the stand is set to let Ariadna fire the igniter
+  const ar=document.getElementById('ari');
+  document.getElementById('ariRow').style.display=d.link?'flex':'none';
+  if(d.link){
+    if(d.lk_rdy){ar.textContent='READY';cls(ar,'ok');}
+    else if(d.lk_ok){ar.textContent='NOT READY';cls(ar,'warn');}
+    else {ar.textContent='NO LINK';cls(ar,'crit');}
+  }
+  // ... and the state of the pyro on Ariadna: armed or safe, fired
+  const ap=document.getElementById('ariPyro');
+  document.getElementById('ariPyroRow').style.display=d.link?'flex':'none';
+  if(d.link){
+    if(!d.lk_ok){ap.textContent='unknown';cls(ap,'warn');}
+    else if(d.lk_fired){ap.textContent='FIRED';cls(ap,'crit');}
+    else if(d.lk_arm){ap.textContent='ARMED';cls(ap,'crit');}
+    else {ap.textContent='safe (disarmed)';cls(ap,'ok');}
+  }
   document.getElementById('ignms').textContent=d.ign_ms+' ms';
   const sd=document.getElementById('stall');
   if(d.stall_ok){sd.textContent='armed ('+(d.stall_ms/1000).toFixed(2)+' s cycle)';cls(sd,'ok');}
@@ -1054,14 +1196,15 @@ tick();
 static void handleRoot() { server.send_P(200, "text/html", html_page); }
 
 static void handleData() {
-  char json[600];
+  char json[800];
   snprintf(json, sizeof(json),
            "{\"state\":%lu,\"thrust\":%ld,\"raw\":%ld,\"cont\":%d,\"rbf\":%d,\"pyro\":%d,"
            "\"hx\":%d,\"log\":%d,\"free\":%lu,\"next_overwrite\":%lu,\"t\":%ld,"
            "\"samples\":%lu,\"burns\":%lu,"
            "\"boots\":%lu,\"resumes\":%lu,\"abort\":\"%s\",\"ign_ms\":%lu,\"batt_mV\":%ld,"
            "\"batt_warn_mV\":%d,\"batt_crit_mV\":%d,"
-           "\"stall_ms\":%lu,\"stall_ok\":%d}",
+           "\"stall_ms\":%lu,\"stall_ok\":%d,"
+           "\"link\":%d,\"lk_ok\":%d,\"lk_rdy\":%d,\"lk_arm\":%d,\"lk_fired\":%d}",
            (unsigned long)tlm_state, (long)tlm_thrust_mN, (long)tlm_raw,
            tlm_cont ? 1 : 0, tlm_rbf ? 1 : 0, tlm_pyro ? 1 : 0,
            tlm_hx_ok ? 1 : 0, tlm_log_ok ? 1 : 0, (unsigned long)tlm_free_slots,
@@ -1071,7 +1214,10 @@ static void handleData() {
            abortName(tlm_last_abort), (unsigned long)tlm_ignition_ms, (long)tlm_batt_mV,
            (int)BATT_WARN_MV, (int)BATT_CRIT_MV,
            (unsigned long)stallPeriodMs,
-           (stallAgree >= 2 && stallPeriodMs) ? 1 : 0);
+           (stallAgree >= 2 && stallPeriodMs) ? 1 : 0,
+           ariLink.active() ? 1 : 0, ariLink.ariadna_alive(millis()) ? 1 : 0,
+           ariLink.ariadna_ready(millis()) ? 1 : 0,
+           ariLink.ariadna_armed(millis()) ? 1 : 0, ariLink.ariadna_fired(millis()) ? 1 : 0);
   server.send(200, "application/json", json);
 }
 
@@ -1101,6 +1247,11 @@ static void handleFire() {
   if (tlm_rbf)              { server.send(409, "text/plain", "remove the RBF key"); return; }
   if (!tlm_log_ok)          { server.send(409, "text/plain", "storage fault"); return; }
   if (!tlm_hx_ok)           { server.send(409, "text/plain", "load cell fault"); return; }
+  if (ariLink.active() && !ariLink.may_start(millis())) {
+    server.send(409, "text/plain",
+                ariLink.ariadna_alive(millis()) ? "Ariadna is not ready" : "no link to Ariadna");
+    return;
+  }
 #if REQUIRE_CONTINUITY_TO_ARM
   // Mirrors interlocksOk() on core 0, which silently refuses to start the
   // countdown without continuity. Without this check the web UI would
@@ -1146,6 +1297,86 @@ static void handleSetIgnition() {
   server.send(200, "text/plain", "igniter on-time updated");
 }
 
+// =====================================================================
+//  Ariadna link - I2C slave, runs in interrupt context on core 1
+//
+//  Ariadna is the master: it writes a register byte and then reads, or
+//  writes its heartbeat. Nothing here prints, waits or allocates. The
+//  protocol and every decision live in sf_stand_link.h / sf_link_proto.h,
+//  which are tested on a workstation; this is only the wire.
+//
+//  PAGE reads serve the last burn straight out of the log's flash through
+//  XIP. They are refused unless the stand is idle (sf_stand_link.h), and the
+//  idle erase-ahead pauses while a copy is pending, so neither a program nor
+//  an erase can run underneath a read.
+// =====================================================================
+static volatile uint8_t  link_reg    = SFL_REG_STATUS;
+static volatile uint16_t link_page   = 0;
+static volatile uint8_t  link_chunk  = 0;
+static volatile uint8_t  link_req_ok = 0;
+
+static void linkOnReceive(int n) {
+  uint8_t buf[16];
+  int len = 0;
+  while (n-- > 0 && Wire.available()) {
+    const int b = Wire.read();
+    if (len < (int)sizeof(buf)) buf[len++] = (uint8_t)b;
+  }
+  while (Wire.available()) (void)Wire.read();
+  if (len < 1) return;                      // a bus scan: nothing to do
+
+  switch (buf[0]) {
+    case SFL_REG_STATUS:
+    case SFL_REG_INFO:
+      link_reg = buf[0];
+      break;
+    case SFL_REG_HEARTBEAT:
+      ariLink.on_heartbeat(buf + 1, (size_t)(len - 1), millis());
+      break;
+    case SFL_REG_PAGE: {
+      uint16_t pg; uint8_t ch;
+      link_req_ok = (len == (int)SFL_PAGE_REQ_SIZE) && sfl_page_req_decode(buf + 1, &pg, &ch);
+      if (link_req_ok) { link_page = pg; link_chunk = ch; }
+      link_reg = SFL_REG_PAGE;
+      break;
+    }
+    default:
+      break;                                // unknown register: ignore
+  }
+}
+
+static void linkOnRequest() {
+  uint8_t buf[SFL_CHUNK_REPLY];
+  size_t n;
+  switch (link_reg) {
+    case SFL_REG_INFO:
+      ariLink.build_info(buf);
+      n = SFL_INFO_SIZE;
+      break;
+    case SFL_REG_PAGE: {
+      const uint8_t code = link_req_ok ? ariLink.page_code(link_page, link_chunk)
+                                       : (uint8_t)SFL_PG_BADREQ;
+      if (code == SFL_PG_OK) {
+        const uint32_t slot = (ariLink.burn_id - 1) % flashLog.slotCount();
+        sfl_chunk_reply_encode(code,
+            flashLog.pagePtr(slot, link_page) + (uint32_t)link_chunk * SFL_CHUNK, buf);
+      } else {
+        sfl_chunk_reply_encode(code, nullptr, buf);
+      }
+      n = SFL_CHUNK_REPLY;
+      break;
+    }
+    default:
+      ariLink.build_status(micros(), millis(), buf);
+      n = SFL_STATUS_SIZE;
+      break;
+  }
+  // Wire.write() in slave mode feeds the TX FIFO and waits per byte for room;
+  // a master that stops early must not leave us waiting for the rest.
+  for (size_t i = 0; i < n; i++)
+    if (Wire.write(buf[i]) != 1) break;
+}
+
 void setup1() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
@@ -1157,6 +1388,19 @@ void setup1() {
   server.on("/api/set_ignition", HTTP_POST, handleSetIgnition);
   server.onNotFound([]() { server.send(404, "text/plain", "no"); });
   server.begin();
+
+  // The WiFi page is up first, exactly as before. Then wait for core 0: the
+  // link mode comes from the journal it is loading, and in standalone mode
+  // the I2C pins are never touched.
+  while (!core0_ready) { delay(1); }
+  if (ariLink.active()) {
+    Wire.setSDA(PIN_LINK_SDA);
+    Wire.setSCL(PIN_LINK_SCL);
+    Wire.setTimeout(3, false);
+    Wire.onReceive(linkOnReceive);
+    Wire.onRequest(linkOnRequest);
+    Wire.begin((uint8_t)SFL_I2C_ADDR);      // its interrupt is attached on THIS core
+  }
 }
 
 void loop1() {
