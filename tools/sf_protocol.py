@@ -464,6 +464,23 @@ class Stand:
         self.command(f"ign {ms}")
         time.sleep(1.0)
 
+    def set_link_mode(self, mode: str, reboot: bool = True) -> str:
+        """Choose who fires the igniter: "off" (this board, the default) or
+        "ariadna" (an Ariadna V2 over I2C). The setting is stored on the
+        stand and takes effect after a restart, which is done here unless
+        reboot=False. Returns what the stand said."""
+        mode = mode.lower()
+        if mode not in ("off", "ariadna"):
+            raise ValueError("mode must be 'off' or 'ariadna'")
+        self.ser.reset_input_buffer()
+        self.command(f"link {mode}")
+        out = self.drain(1.5)
+        if reboot and "saved" in out:
+            self.command("reboot")
+            out += self.drain(1.0)
+            time.sleep(3.0)         # the USB port comes back by itself
+        return out
+
     def drain(self, seconds: float = 1.5) -> str:
         """Collect whatever the stand printed, e.g. after a command."""
         out, deadline = [], time.time() + seconds

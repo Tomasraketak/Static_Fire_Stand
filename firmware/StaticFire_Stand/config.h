@@ -17,6 +17,29 @@
 #define PIN_BATT_ADC  27    // battery voltage sense, through the divider below (ADC1)
 
 // ---------------------------------------------------------------------
+//  ARIADNA LINK (optional)
+//
+//  An Ariadna V2 flight computer can be connected over I2C (the stand is
+//  the slave, address 0x2C). In that mode the stand does NOT fire its own
+//  MOSFET: it runs the countdown and the recording as always, and at T0
+//  tells Ariadna to fire its pyro 1. The load cell keeps recording, and
+//  after the burn Ariadna copies the whole record into its own flash.
+//
+//  The mode is a setting stored on the device, not a build option, and it
+//  defaults to STANDALONE: a stand that was never told about Ariadna behaves
+//  exactly as it always did and never touches GP4 / GP5.
+//
+//    serial   link ariadna | link off     (then `reboot`)
+//    tools    static_fire.py --link ariadna | off
+//
+//  Protocol: docs/ARIADNA_LINK.md, firmware/StaticFire_Stand/sf_link_proto.h
+// ---------------------------------------------------------------------
+#define PIN_LINK_SDA        4    // I2C0 SDA  -> Ariadna I2C1/I2C2 (SDA). No pull-ups here:
+#define PIN_LINK_SCL        5    // I2C0 SCL  -> Ariadna I2C1/I2C2 (SCL). Ariadna has 10k to 3V3.
+                                 // Connect GND, SDA, SCL only - never the 3V3 pins together.
+#define LINK_MODE_DEFAULT   0    // used on a virgin device only: 0 standalone, 1 Ariadna
+
+// ---------------------------------------------------------------------
 //  SEQUENCE TIMING
 // ---------------------------------------------------------------------
 #define COUNTDOWN_MS      15000UL   // armed -> T0
@@ -134,5 +157,7 @@
 #define LOG_SLOT_BYTES     (64u * 1024u)
 #define LOG_JOURNAL_BYTES  (2u * 4096u) // two sectors, A/B rotated
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.1.0"
+#define FW_MAJOR   2
+#define FW_MINOR   1
 #define BAUD_RATE  115200

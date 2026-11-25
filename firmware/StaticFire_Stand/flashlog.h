@@ -129,7 +129,8 @@ struct SfJournal {
   int32_t  tare_offset;
   uint32_t slot_erased_mask;  // bit N set = slot N is erased and ready
   uint32_t ignition_ms;       // igniter on-time, ms (0 = use the firmware default)
-  uint32_t reserved[4];
+  uint32_t link_mode;         // 0 standalone, 1 Ariadna fires the igniter (0 on every older journal)
+  uint32_t reserved[3];
   uint8_t  pad[SF_PAGE_SIZE - 4 * 16];
 };
 

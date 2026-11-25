@@ -8,7 +8,8 @@ Test stand for static firing of solid rocket motors. The controller is a
 |---|---|
 | `firmware/StaticFire_Stand/` | firmware for the Pico 2 W (Arduino / arduino-pico) |
 | `tools/` | download, analysis, charts, Excel export — GUI (`sf_gui.py`) and console (`static_fire.py`) front ends |
-| `docs/` | on-flash and on-wire data formats |
+| `docs/` | on-flash and on-wire data formats, and the [Ariadna link](docs/ARIADNA_LINK.md) |
+| `tests/` | host tests of the link logic (`make`) and a syntax check of the firmware (`make syntax`) |
 
 If you just want to fire a motor, jump to
 [**4. Operating tutorial**](#4-operating-tutorial). If you want to know
@@ -75,6 +76,11 @@ If the journal says a burn was live when the stand booted, the firmware:
   deaf — they stop the sequence at any moment.)
 * The web code is compared in constant time, with a one-minute lockout
   after 5 wrong attempts.
+
+With the Ariadna link on (`link ariadna`), `PIN_IGNITION` is **never** driven: `pyroSet()` still
+runs every check above and still marks the pyro window in the record, but the gate stays LOW and
+the ignition is Ariadna's. The countdown additionally aborts if Ariadna drops out or withdraws its
+READY, and refuses to start without it. Standalone, none of this exists.
 
 Igniter continuity is measured and shown on the status pixel, the web UI
 and `i`/`--info`, but by default it is **informational only** — it does
@@ -190,6 +196,19 @@ will show up on your thrust curve.
 
 **Tie the HX711 RATE pin to VCC.** Left floating it runs at 10 SPS and
 your thrust curve will be a handful of dots.
+
+### Optional: connecting an Ariadna V2
+
+| Pico pin | Function | Note |
+|---|---|---|
+| GP4 | I2C0 SDA | to Ariadna Master `I2C1`/`I2C2` (SDA) |
+| GP5 | I2C0 SCL | to Ariadna Master `I2C1`/`I2C2` (SCL) |
+
+Plus GND. **Not** the 3V3 pins, and no pull-ups on this side. Unused (and untouched) unless you
+switch the link on with `link ariadna`: with it, **Ariadna fires the igniter** (its pyro 1) and
+copies the record afterwards, while this board keeps running the countdown and recording the thrust.
+Without it the stand is exactly as described everywhere else in this file. Details, protocol and
+safety rules: [docs/ARIADNA_LINK.md](docs/ARIADNA_LINK.md).
 
 ### Battery voltage sense
 
@@ -586,6 +605,9 @@ p <slot>    dump one slot
 d           erase all data
 abort       abort the running countdown
 s           one thrust reading
+link        show who fires the igniter (this board / Ariadna) and the state of the link
+link ariadna | link off    choose; takes effect after `reboot`
+reboot      restart the stand (idle only)
 ```
 
 ---
