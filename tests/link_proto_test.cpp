@@ -229,6 +229,21 @@ static void test_page_codes()
     CHECK(L.page_code(0, 0) == SFL_PG_BUSY);
 }
 
+static void test_armed_and_fired_for_the_web_page()
+{
+    SfStandLink L; L.init(SFL_MODE_ARIADNA, 2, 1);
+    CHECK(!L.ariadna_armed(100) && !L.ariadna_fired(100));          // never heard: neither
+    hb_send(L, SFL_A_READY, 0, 0, 100);
+    CHECK(!L.ariadna_armed(110) && !L.ariadna_fired(110));          // safe
+    hb_send(L, SFL_A_READY | SFL_A_ARMED, 0, 0, 200);
+    CHECK(L.ariadna_armed(210) && !L.ariadna_fired(210));
+    hb_send(L, SFL_A_READY | SFL_A_FIRED, 1, 0, 300);
+    CHECK(!L.ariadna_armed(310) && L.ariadna_fired(310));
+    // an Ariadna that went quiet is not "armed", whatever it said last: the page says "unknown"
+    hb_send(L, SFL_A_ARMED, 0, 0, 400);
+    CHECK(!L.ariadna_armed(400 + SFL_HB_TIMEOUT_MS));
+}
+
 static void test_abort_rules()
 {
     SfStandLink L; L.init(SFL_MODE_ARIADNA, 2, 1);
@@ -250,6 +265,7 @@ int main()
     test_heartbeat_rejects_garbage();
     test_page_codes();
     test_abort_rules();
+    test_armed_and_fired_for_the_web_page();
     printf("link proto test: %d passed, %d failed\n", s_pass, s_fail);
     return s_fail ? 1 : 0;
 }

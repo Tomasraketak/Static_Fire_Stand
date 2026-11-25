@@ -324,7 +324,7 @@ static void printInfoJson() {
                 "\"preroll_ms\":%lu,\"recording_ms\":%lu,\"ignition_ms\":%lu,"
                 "\"countdown_ms\":%lu,\"state\":%lu,\"batt_mV\":%ld,"
                 "\"stall_count\":%lu,\"stall_period_ms\":%lu,\"stall_agree\":%u,"
-                "\"link_mode\":%lu,\"link_ok\":%d,\"ariadna_ready\":%d}\n",
+                "\"link_mode\":%lu,\"link_ok\":%d,\"ariadna_ready\":%d,\"ariadna_armed\":%d}\n",
                 FW_VERSION,
                 (unsigned long)flashLog.journal().boot_count,
                 (unsigned long)flashLog.journal().resume_count,
@@ -341,7 +341,8 @@ static void printInfoJson() {
                 (unsigned long)stallCount, (unsigned long)stallPeriodMs,
                 (unsigned)stallAgree,
                 (unsigned long)ariLink.mode, ariLink.ariadna_alive(millis()) ? 1 : 0,
-                ariLink.ariadna_ready(millis()) ? 1 : 0);
+                ariLink.ariadna_ready(millis()) ? 1 : 0,
+                ariLink.ariadna_armed(millis()) ? 1 : 0);
 }
 
 // Dumps raw 256 byte pages as base64, one line per page. Every page
@@ -1051,6 +1052,7 @@ const char html_page[] PROGMEM = R"rawliteral(
   <div class="row"><span>RBF key</span><span class="v" id="rbf">--</span></div>
   <div class="row"><span>Pyro channel</span><span class="v" id="pyro">--</span></div>
   <div class="row" id="ariRow" style="display:none"><span>Ariadna</span><span class="v" id="ari">--</span></div>
+  <div class="row" id="ariPyroRow" style="display:none"><span>Ariadna pyro 1</span><span class="v" id="ariPyro">--</span></div>
   <div class="row"><span>Load cell</span><span class="v" id="hx">--</span></div>
   <div class="row"><span>Battery</span><span class="v" id="batt">--</span></div>
   <div class="row"><span>Storage</span><span class="v" id="log">--</span></div>
@@ -1122,7 +1124,9 @@ async function tick(){
   document.getElementById('timer').textContent =
     d.state==2 ? 'T-'+(d.t/1000).toFixed(1)+' s' :
     d.state==3 ? 'T+'+(d.t/1000).toFixed(1)+' s' : '--';
-  const c=document.getElementById('cont');c.textContent=d.cont?'OK':'OPEN';cls(c,d.cont?'ok':'crit');
+  const c=document.getElementById('cont');
+  if(d.link&&!d.lk_ok){c.textContent='no link to Ariadna';cls(c,'crit');}
+  else {c.textContent=(d.cont?'OK':'OPEN')+(d.link?' (Ariadna)':'');cls(c,d.cont?'ok':'crit');}
   const r=document.getElementById('rbf');r.textContent=d.rbf?'IN / SAFE':'OUT / ARMED';cls(r,d.rbf?'ok':'warn');
   const p=document.getElementById('pyro');
   p.textContent=d.link?(d.pyro?'ARIADNA FIRING':'Ariadna'):(d.pyro?'LIVE':'off');cls(p,d.pyro?'crit':'ok');
@@ -1149,6 +1153,15 @@ async function tick(){
     if(d.lk_rdy){ar.textContent='READY';cls(ar,'ok');}
     else if(d.lk_ok){ar.textContent='NOT READY';cls(ar,'warn');}
     else {ar.textContent='NO LINK';cls(ar,'crit');}
+  }
+  // ... and the state of the pyro on Ariadna: armed or safe, fired
+  const ap=document.getElementById('ariPyro');
+  document.getElementById('ariPyroRow').style.display=d.link?'flex':'none';
+  if(d.link){
+    if(!d.lk_ok){ap.textContent='unknown';cls(ap,'warn');}
+    else if(d.lk_fired){ap.textContent='FIRED';cls(ap,'crit');}
+    else if(d.lk_arm){ap.textContent='ARMED';cls(ap,'crit');}
+    else {ap.textContent='safe (disarmed)';cls(ap,'ok');}
   }
   document.getElementById('ignms').textContent=d.ign_ms+' ms';
   const sd=document.getElementById('stall');
@@ -1183,7 +1196,7 @@ tick();
 static void handleRoot() { server.send_P(200, "text/html", html_page); }
 
 static void handleData() {
-  char json[700];
+  char json[800];
   snprintf(json, sizeof(json),
            "{\"state\":%lu,\"thrust\":%ld,\"raw\":%ld,\"cont\":%d,\"rbf\":%d,\"pyro\":%d,"
            "\"hx\":%d,\"log\":%d,\"free\":%lu,\"next_overwrite\":%lu,\"t\":%ld,"
@@ -1191,7 +1204,7 @@ static void handleData() {
            "\"boots\":%lu,\"resumes\":%lu,\"abort\":\"%s\",\"ign_ms\":%lu,\"batt_mV\":%ld,"
            "\"batt_warn_mV\":%d,\"batt_crit_mV\":%d,"
            "\"stall_ms\":%lu,\"stall_ok\":%d,"
-           "\"link\":%d,\"lk_ok\":%d,\"lk_rdy\":%d}",
+           "\"link\":%d,\"lk_ok\":%d,\"lk_rdy\":%d,\"lk_arm\":%d,\"lk_fired\":%d}",
            (unsigned long)tlm_state, (long)tlm_thrust_mN, (long)tlm_raw,
            tlm_cont ? 1 : 0, tlm_rbf ? 1 : 0, tlm_pyro ? 1 : 0,
            tlm_hx_ok ? 1 : 0, tlm_log_ok ? 1 : 0, (unsigned long)tlm_free_slots,
@@ -1203,7 +1216,8 @@ static void handleData() {
            (unsigned long)stallPeriodMs,
            (stallAgree >= 2 && stallPeriodMs) ? 1 : 0,
            ariLink.active() ? 1 : 0, ariLink.ariadna_alive(millis()) ? 1 : 0,
-           ariLink.ariadna_ready(millis()) ? 1 : 0);
+           ariLink.ariadna_ready(millis()) ? 1 : 0,
+           ariLink.ariadna_armed(millis()) ? 1 : 0, ariLink.ariadna_fired(millis()) ? 1 : 0);
   server.send(200, "application/json", json);
 }
 

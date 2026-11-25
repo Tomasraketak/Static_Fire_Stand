@@ -96,6 +96,16 @@ struct SfStandLink {
         return sfl_rx_alive(&rx, now_ms) && (sfl_rx_get(&rx).flags & SFL_A_CONT);
     }
 
+    /** Pyro 1 on Ariadna is armed / has been commanded (0 when Ariadna is not heard). */
+    int ariadna_armed(uint32_t now_ms) const
+    {
+        return sfl_rx_alive(&rx, now_ms) && (sfl_rx_get(&rx).flags & SFL_A_ARMED);
+    }
+    int ariadna_fired(uint32_t now_ms) const
+    {
+        return sfl_rx_alive(&rx, now_ms) && (sfl_rx_get(&rx).flags & SFL_A_FIRED);
+    }
+
     /** Can a countdown start right now? (the stand's own interlocks are
      *  checked by the caller; this adds Ariadna's.) */
     int may_start(uint32_t now_ms) const

@@ -25,7 +25,7 @@ tools:            python static_fire.py --link ariadna        (restarts the stan
 
 `link` alone shows the mode and what the stand thinks of Ariadna. The setting survives power cuts
 (it lives in the journal). In `ariadna` mode the web page grows an **Ariadna** row
-(`READY` / `NOT READY` / `NO LINK`) and the START COUNTDOWN button stays disabled until Ariadna is ready.
+(`READY` / `NOT READY` / `NO LINK`), an **Ariadna pyro 1** row (`safe (disarmed)` / `ARMED` / `FIRED`, `unknown` without a link), and the Continuity row shows Ariadna's igniter (`OK (Ariadna)` / `OPEN (Ariadna)` / `no link to Ariadna`). The START COUNTDOWN button stays disabled until Ariadna is ready.
 
 > In `ariadna` mode **the gate on GP21 is never driven**. Do not connect an igniter to this board
 > and to Ariadna at the same time.
