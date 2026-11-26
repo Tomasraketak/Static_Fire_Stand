@@ -28,6 +28,7 @@ import webbrowser
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
+from tkinter import font as tkfont
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -40,25 +41,44 @@ from static_fire import download, new_output_dir, open_folder, run_analysis  # n
 APP_TITLE = "Static Fire Stand"
 FW_IGNITION_CEILING_MS = 5000
 
-# Two themes: "dark" matches the stand's own web UI for indoor/desk use.
-# "sunlight" is a high-contrast light theme for a laptop screen outdoors -
-# a dark UI mostly turns into a mirror in direct sun, so this instead uses
-# near-black text on a light, low-glare ground with deliberately darkened
-# accent colours (the web UI's amber/green read as washed-out pastel on a
-# bright screen at max brightness).
+# Look and feel: the VoltinoLabs design system (the same tokens as the
+# Daidalos Actuator Console: deep indigo ground, one amber accent, outlined
+# buttons, mono numbers). Two themes:
+#   "dark"      the VoltinoLabs palette, for the desk;
+#   "sunlight"  the same layout in a high-contrast light palette for a laptop
+#               screen outdoors - a dark UI mostly turns into a mirror in
+#               direct sun, so this one uses near-black text on a light, low-
+#               glare ground and a deliberately darkened amber.
+def _mix(fg: str, bg: str, a: float) -> str:
+    """`fg` at opacity `a` over `bg` (tkinter has no rgba)."""
+    f = [int(fg[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(bg[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x * a + y * (1 - a)):02x}" for x, y in zip(f, b))
+
+
+def _palette(bg, raised, surface, text, muted, subtle, accent, accent_soft, accent_strong,
+             positive, danger, on_accent) -> dict:
+    return dict(
+        bg=bg, card=raised, card2=surface, ink=text, mut=muted, subtle=subtle,
+        line=_mix(text, bg, 0.10), line_strong=_mix(text, bg, 0.18), hover_line=_mix(text, bg, 0.35),
+        ok=positive, warn=accent, crit=danger,
+        acc=accent, acc_soft=accent_soft, acc_active=accent_strong, acc_tint=_mix(accent, bg, 0.12),
+        danger=danger, danger_active=accent_strong, danger_tint=_mix(danger, bg, 0.14),
+        entry_bg=surface, select=_mix(accent, bg, 0.30), on_accent=on_accent,
+        dim=_mix(muted, bg, 0.45),
+    )
+
+
 PALETTES = {
-    "dark": dict(
-        bg="#0d0d0d", card="#1a1a19", card2="#141413", ink="#f4f4f2", mut="#9b9a94",
-        line="#2c2c2a", ok="#0ca30c", warn="#fab219", crit="#d03b3b", acc="#3987e5",
-        acc_active="#5aa0f0", danger="#a92e2e", danger_active="#c23a3a",
-        entry_bg="#000000", select="#233247",
-    ),
-    "sunlight": dict(
-        bg="#f2f1ec", card="#ffffff", card2="#e4e2d9", ink="#000000", mut="#3a3a36",
-        line="#8a887e", ok="#0a6e0a", warn="#a15c00", crit="#a3241c", acc="#0a4fb0",
-        acc_active="#083c87", danger="#a3241c", danger_active="#7e1c16",
-        entry_bg="#ffffff", select="#cfe0ff",
-    ),
+    # tokens.json of the VoltinoLabs artifact
+    "dark": _palette(bg="#161826", raised="#1c1e2b", surface="#232532", text="#e9e9ed",
+                     muted="#b2b6ca", subtle="#75798c", accent="#f5a51c", accent_soft="#ffcf7a",
+                     accent_strong="#ffb734", positive="#5dd39e", danger="#f2777a",
+                     on_accent="#161826"),
+    "sunlight": _palette(bg="#f4f2ec", raised="#ffffff", surface="#e9e6dc", text="#161826",
+                         muted="#3d4055", subtle="#5c6075", accent="#9a5b00", accent_soft="#7a4800",
+                         accent_strong="#7a4800", positive="#0a6e46", danger="#b3261e",
+                         on_accent="#ffffff"),
 }
 DEFAULT_THEME = "dark"
 THEME_LABEL = {"dark": "Dark", "sunlight": "Sunlight"}
@@ -114,9 +134,11 @@ class Tooltip:
         except tk.TclError:
             pass
         self.tip.wm_geometry(f"+{x}+{y}")
-        tk.Label(self.tip, text=self.text, justify="left", background="#26261f",
-                foreground="#eeeeee", relief="solid", borderwidth=1,
-                font=("Segoe UI", 9), padx=7, pady=4, wraplength=300).pack()
+        pal = getattr(self.widget.winfo_toplevel(), "palette", None) or PALETTES[DEFAULT_THEME]
+        tk.Label(self.tip, text=self.text, justify="left", background=pal["card2"],
+                foreground=pal["ink"], relief="solid", borderwidth=1,
+                font=(getattr(self.widget.winfo_toplevel(), "ui_font", "Segoe UI"), 9),
+                padx=8, pady=5, wraplength=300).pack()
 
     def _hide(self, _evt=None) -> None:
         if self._after_id:
@@ -142,6 +164,7 @@ class App(tk.Tk):
         self.last_outdir: Path | None = None
         self.theme = DEFAULT_THEME
         self.palette = PALETTES[self.theme]
+        self._set_window_identity()
 
         self._build_style()
         self._build_menubar()
@@ -150,9 +173,35 @@ class App(tk.Tk):
         self.after(self.POLL_MS, self._drain_log)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _set_window_identity(self) -> None:
+        """Own taskbar identity and the window icon (Windows); harmless elsewhere."""
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VoltinoLabs.StaticFireStand")
+        except Exception:
+            pass
+        ico = SCRIPT_DIR / "windows" / "sf_stand.ico"
+        try:
+            if ico.exists():
+                self.iconbitmap(default=str(ico))
+        except tk.TclError:
+            pass
+
     # -- look and feel -----------------------------------------------------
+    def _pick_fonts(self) -> None:
+        have = set(tkfont.families(self))
+        self.ui_font = next((f for f in ("Inter", "Segoe UI Variable Text", "Segoe UI", "Helvetica Neue",
+                                         "Helvetica", "DejaVu Sans") if f in have), "TkDefaultFont")
+        self.mono_font = next((f for f in ("JetBrains Mono", "Cascadia Mono", "Consolas", "Menlo",
+                                           "DejaVu Sans Mono") if f in have), MONO[0])
+
     def _build_style(self) -> None:
         p = self.palette
+        if not hasattr(self, "ui_font"):
+            self._pick_fonts()
+        F = self.ui_font
         self.configure(bg=p["bg"])
         style = ttk.Style(self)
         try:
@@ -161,60 +210,97 @@ class App(tk.Tk):
             pass
 
         style.configure(".", background=p["bg"], foreground=p["ink"],
-                        fieldbackground=p["entry_bg"], bordercolor=p["line"],
-                        darkcolor=p["line"], lightcolor=p["line"],
-                        troughcolor=p["card"], font=("Segoe UI", 10))
+                        fieldbackground=p["entry_bg"], bordercolor=p["line_strong"],
+                        darkcolor=p["bg"], lightcolor=p["bg"], focuscolor=p["acc"],
+                        troughcolor=p["card2"], font=(F, 10))
         style.configure("TFrame", background=p["bg"])
         style.configure("Card.TFrame", background=p["card"])
+        style.configure("Rule.TFrame", background=p["line"])
         style.configure("TLabel", background=p["bg"], foreground=p["ink"])
         style.configure("Mut.TLabel", background=p["bg"], foreground=p["mut"])
+        style.configure("Kicker.TLabel", background=p["bg"], foreground=p["acc_soft"],
+                        font=(F, 8, "bold"))
         style.configure("Header.TLabel", background=p["bg"], foreground=p["ink"],
-                        font=("Segoe UI", 15, "bold"))
-        style.configure("SubHeader.TLabel", background=p["bg"], foreground=p["mut"],
-                        font=("Segoe UI", 9))
-        style.configure("TLabelframe", background=p["bg"], bordercolor=p["line"])
-        style.configure("TLabelframe.Label", background=p["bg"], foreground=p["mut"],
-                        font=("Segoe UI", 9, "bold"))
-        style.configure("TCheckbutton", background=p["bg"], foreground=p["ink"])
-        style.map("TCheckbutton", background=[("active", p["bg"])])
+                        font=(F, 18))
+        style.configure("HeaderAccent.TLabel", background=p["bg"], foreground=p["acc"],
+                        font=(F, 18))
+        style.configure("SubHeader.TLabel", background=p["bg"], foreground=p["subtle"],
+                        font=(F, 9))
+        # a section: hairline border, small accent kicker for the caption
+        style.configure("TLabelframe", background=p["bg"], bordercolor=p["line"],
+                        darkcolor=p["line"], lightcolor=p["line"], relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=p["bg"], foreground=p["acc_soft"],
+                        font=(F, 8, "bold"))
+        style.configure("TCheckbutton", background=p["bg"], foreground=p["mut"], focuscolor=p["bg"])
+        style.map("TCheckbutton", background=[("active", p["bg"])],
+                  foreground=[("active", p["ink"])],
+                  indicatorcolor=[("selected", p["acc"]), ("!selected", p["card2"])],
+                  bordercolor=[("focus", p["acc"])])
         style.configure("TEntry", fieldbackground=p["entry_bg"], foreground=p["ink"],
-                        insertcolor=p["ink"], bordercolor=p["line"])
+                        insertcolor=p["ink"], bordercolor=p["line_strong"], padding=4)
+        style.map("TEntry", bordercolor=[("focus", p["acc"])], lightcolor=[("focus", p["acc"])],
+                  darkcolor=[("focus", p["acc"])])
         style.configure("TCombobox", fieldbackground=p["entry_bg"], foreground=p["ink"],
-                        background=p["card"], arrowcolor=p["mut"])
+                        background=p["card2"], arrowcolor=p["mut"], bordercolor=p["line_strong"],
+                        padding=4)
         style.map("TCombobox", fieldbackground=[("readonly", p["entry_bg"])],
-                  foreground=[("readonly", p["ink"])])
+                  foreground=[("readonly", p["ink"])], bordercolor=[("focus", p["acc"])],
+                  selectbackground=[("readonly", p["entry_bg"])],
+                  selectforeground=[("readonly", p["ink"])])
         self.option_add("*TCombobox*Listbox.background", p["entry_bg"])
         self.option_add("*TCombobox*Listbox.foreground", p["ink"])
         self.option_add("*TCombobox*Listbox.selectBackground", p["select"])
+        self.option_add("*TCombobox*Listbox.selectForeground", p["ink"])
+        self.option_add("*Menu.background", p["card2"])
+        self.option_add("*Menu.foreground", p["ink"])
+        self.option_add("*Menu.activeBackground", p["select"])
+        self.option_add("*Menu.activeForeground", p["ink"])
 
-        style.configure("TNotebook", background=p["bg"], bordercolor=p["line"])
-        style.configure("TNotebook.Tab", background=p["card"], foreground=p["mut"],
-                        padding=(14, 7), font=("Segoe UI", 10))
+        style.configure("TNotebook", background=p["bg"], bordercolor=p["line"], borderwidth=1,
+                        lightcolor=p["line"], darkcolor=p["line"], tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", background=p["bg"], foreground=p["subtle"],
+                        padding=(16, 8), font=(F, 10), bordercolor=p["bg"], borderwidth=1,
+                        lightcolor=p["bg"], darkcolor=p["bg"])
         style.map("TNotebook.Tab",
-                  background=[("selected", p["bg"])],
-                  foreground=[("selected", p["ink"])])
+                  background=[("selected", p["card"]), ("active", p["bg"])],
+                  foreground=[("selected", p["acc"]), ("active", p["ink"])],
+                  bordercolor=[("selected", p["line"]), ("!selected", p["bg"])],
+                  lightcolor=[("selected", p["card"])], darkcolor=[("selected", p["card"])])
 
-        style.configure("TButton", background=p["card"], foreground=p["ink"],
-                        bordercolor=p["line"], focusthickness=1, padding=(10, 8))
+        # Buttons are OUTLINED, as everywhere in VoltinoLabs: text + hairline,
+        # amber for the one primary action, red for the dangerous one.
+        style.configure("TButton", background=p["bg"], foreground=p["mut"],
+                        bordercolor=p["line_strong"], focusthickness=1, focuscolor=p["acc"],
+                        padding=(12, 8), font=(F, 10), borderwidth=1, relief="solid",
+                        lightcolor=p["bg"], darkcolor=p["bg"])
         style.map("TButton",
-                  background=[("disabled", p["card2"]), ("active", p["line"])],
-                  foreground=[("disabled", p["mut"])])
-        style.configure("Accent.TButton", background=p["acc"], foreground="#ffffff",
-                        bordercolor=p["acc"], padding=(10, 9), font=("Segoe UI", 10, "bold"))
+                  background=[("disabled", p["bg"]), ("active", p["bg"])],
+                  foreground=[("disabled", p["dim"]), ("active", p["ink"])],
+                  bordercolor=[("disabled", p["line"]), ("active", p["hover_line"]),
+                               ("focus", p["acc"])])
+        style.configure("Accent.TButton", background=p["bg"], foreground=p["acc"],
+                        bordercolor=p["acc"], padding=(12, 10), font=(F, 10, "bold"),
+                        lightcolor=p["bg"], darkcolor=p["bg"])
         style.map("Accent.TButton",
-                  background=[("disabled", p["card2"]), ("active", p["acc_active"])],
-                  foreground=[("disabled", p["mut"])])
-        style.configure("Danger.TButton", background=p["danger"], foreground="#ffffff",
-                        bordercolor=p["danger"], padding=(10, 8))
+                  background=[("disabled", p["bg"]), ("active", p["acc_tint"])],
+                  foreground=[("disabled", _mix(p["acc"], p["bg"], 0.45)), ("active", p["acc_soft"])],
+                  bordercolor=[("disabled", _mix(p["acc"], p["bg"], 0.25)), ("active", p["acc_soft"])])
+        style.configure("Danger.TButton", background=p["bg"], foreground=p["danger"],
+                        bordercolor=p["danger"], padding=(12, 8))
         style.map("Danger.TButton",
-                  background=[("disabled", p["card2"]), ("active", p["danger_active"])],
-                  foreground=[("disabled", p["mut"])])
-        style.configure("Small.TButton", padding=(6, 3), font=("Segoe UI", 8))
+                  background=[("disabled", p["bg"]), ("active", p["danger_tint"])],
+                  foreground=[("disabled", _mix(p["danger"], p["bg"], 0.4))],
+                  bordercolor=[("disabled", _mix(p["danger"], p["bg"], 0.2))])
+        style.configure("Small.TButton", padding=(8, 3), font=(F, 8))
 
-        style.configure("TProgressbar", background=p["acc"], troughcolor=p["card"],
-                        bordercolor=p["card"], lightcolor=p["acc"], darkcolor=p["acc"])
-        style.configure("Vertical.TScrollbar", background=p["card"], troughcolor=p["bg"],
-                        bordercolor=p["bg"], arrowcolor=p["mut"])
+        style.configure("TProgressbar", background=p["acc"], troughcolor=p["card2"],
+                        bordercolor=p["card2"], lightcolor=p["acc"], darkcolor=p["acc"],
+                        thickness=4)
+        for orient in ("Vertical", "Horizontal"):
+            style.configure(f"{orient}.TScrollbar", background=p["card2"], troughcolor=p["bg"],
+                            bordercolor=p["bg"], arrowcolor=p["subtle"], lightcolor=p["card2"],
+                            darkcolor=p["card2"])
+            style.map(f"{orient}.TScrollbar", background=[("active", p["line_strong"])])
 
     def _build_menubar(self) -> None:
         menubar = tk.Menu(self)
@@ -253,12 +339,13 @@ class App(tk.Tk):
         self._build_style()  # ttk widgets re-render automatically on style change
         p = self.palette
         # plain tk widgets (not ttk) need their colours poked by hand
-        self.log.configure(background=p["entry_bg"], foreground=p["ink"],
-                           insertbackground=p["ink"])
+        self.log.configure(background=p["card2"], foreground=p["mut"],
+                           insertbackground=p["ink"], selectbackground=p["select"],
+                           selectforeground=p["ink"])
         self.log.tag_configure("err", foreground=p["crit"])
         self.log.tag_configure("warn", foreground=p["warn"])
         self.log.tag_configure("ok", foreground=p["ok"])
-        self.log.tag_configure("head", foreground=p["acc"], font=(MONO[0], MONO[1], "bold"))
+        self.log.tag_configure("head", foreground=p["acc"], font=(self.mono_font, 10, "bold"))
         self.status_dot.configure(bg=p["bg"])
         self.status_dot.itemconfig(self._dot, fill=p["warn"] if self.busy else p["ok"])
         self.theme_btn.configure(text=self._theme_btn_text())
@@ -267,12 +354,17 @@ class App(tk.Tk):
     # -- layout --------------------------------------------------------------
     def _build_widgets(self) -> None:
         p = self.palette
-        header = ttk.Frame(self, padding=(16, 14, 16, 6))
+        header = ttk.Frame(self, padding=(20, 16, 20, 10))
         header.pack(fill="x")
         title_row = ttk.Frame(header)
         title_row.pack(fill="x")
-        ttk.Label(title_row, text="STATIC FIRE STAND", style="Header.TLabel").pack(
-            side="left", anchor="w")
+        title_col = ttk.Frame(title_row)
+        title_col.pack(side="left", anchor="w")
+        ttk.Label(title_col, text="VOLTINOLABS  \u00b7  DAIDALOS", style="Kicker.TLabel").pack(anchor="w")
+        title_line = ttk.Frame(title_col)
+        title_line.pack(anchor="w")
+        ttk.Label(title_line, text="Static Fire ", style="Header.TLabel").pack(side="left")
+        ttk.Label(title_line, text="Stand", style="HeaderAccent.TLabel").pack(side="left")
         self.theme_btn = ttk.Button(title_row, text=self._theme_btn_text(),
                                     style="Small.TButton", command=self._toggle_theme)
         self.theme_btn.pack(side="right", anchor="e")
@@ -280,10 +372,11 @@ class App(tk.Tk):
                                 "light theme that stays readable on a laptop screen "
                                 "in direct sunlight.")
         ttk.Label(header, text="Extract, analyse and configure - GUI front end for the tools "
-                              "in this folder.", style="SubHeader.TLabel").pack(anchor="w")
+                              "in this folder.", style="SubHeader.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Frame(self, height=1, style="Rule.TFrame").pack(fill="x")
 
         nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=16, pady=(4, 8))
+        nb.pack(fill="both", expand=True, padx=20, pady=(10, 8))
 
         extract = ttk.Frame(nb, padding=4)
         stand = ttk.Frame(nb, padding=4)
@@ -294,7 +387,7 @@ class App(tk.Tk):
 
         # -- log pane, shared by both tabs -----------------------------------
         log_frame = ttk.LabelFrame(self, text="LOG")
-        log_frame.pack(fill="both", expand=True, padx=16, pady=(0, 6))
+        log_frame.pack(fill="both", expand=True, padx=20, pady=(0, 6))
 
         log_toolbar = ttk.Frame(log_frame)
         log_toolbar.pack(fill="x", padx=4, pady=(4, 0))
@@ -308,17 +401,19 @@ class App(tk.Tk):
                              "traceback here instead of just the error message.")
 
         self.log = scrolledtext.ScrolledText(
-            log_frame, height=14, state="disabled", wrap="word", font=MONO,
-            background=p["entry_bg"], foreground=p["ink"], insertbackground=p["ink"],
-            relief="flat", borderwidth=0, padx=8, pady=6)
+            log_frame, height=14, state="disabled", wrap="word",
+            font=(self.mono_font, 10),
+            background=p["card2"], foreground=p["mut"], insertbackground=p["ink"],
+            selectbackground=p["select"], selectforeground=p["ink"],
+            relief="flat", borderwidth=0, padx=10, pady=8)
         self.log.pack(fill="both", expand=True, padx=4, pady=4)
         self.log.tag_configure("err", foreground=p["crit"])
         self.log.tag_configure("warn", foreground=p["warn"])
         self.log.tag_configure("ok", foreground=p["ok"])
-        self.log.tag_configure("head", foreground=p["acc"], font=(MONO[0], MONO[1], "bold"))
+        self.log.tag_configure("head", foreground=p["acc"], font=(self.mono_font, 10, "bold"))
         self._log_write_welcome()
 
-        status_bar = ttk.Frame(self, padding=(16, 0, 16, 12))
+        status_bar = ttk.Frame(self, padding=(20, 0, 20, 14))
         status_bar.pack(fill="x")
         self.status_dot = tk.Canvas(status_bar, width=10, height=10, bg=p["bg"],
                                     highlightthickness=0)
