@@ -155,8 +155,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("920x700")
-        self.minsize(720, 520)
+        self.geometry("1040x720")
+        self.minsize(900, 560)
 
         self.log_q: "queue.Queue[str]" = queue.Queue()
         self.busy = False
@@ -375,13 +375,14 @@ class App(tk.Tk):
                               "in this folder.", style="SubHeader.TLabel").pack(anchor="w", pady=(2, 0))
         ttk.Frame(self, height=1, style="Rule.TFrame").pack(fill="x")
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=20, pady=(10, 8))
-
-        extract = ttk.Frame(nb, padding=4)
-        stand = ttk.Frame(nb, padding=4)
-        nb.add(extract, text="  Extract && Analyse  ")
-        nb.add(stand, text="  Stand Tools  ")
+        body = ttk.Frame(self)
+        body.pack(fill="x", padx=20, pady=(10, 8))
+        body.columnconfigure(0, weight=3, uniform="cols")
+        body.columnconfigure(1, weight=2, uniform="cols")
+        extract = ttk.LabelFrame(body, text="EXTRACT & ANALYSE", padding=4)
+        stand = ttk.LabelFrame(body, text="STAND TOOLS", padding=4)
+        extract.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        stand.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         self._build_extract_tab(extract)
         self._build_stand_tab(stand)
 
@@ -431,8 +432,8 @@ class App(tk.Tk):
         self.log.configure(state="normal")
         self.log.insert(
             "end",
-            "Ready. Pick an action on the left tab to extract and analyse data, or "
-            "use Stand Tools to tare / calibrate / configure the hardware.\n",
+            "Ready. Pick an action on the left to extract and analyse data, or "
+            "use Stand Tools on the right to tare / calibrate / configure the hardware.\n",
             ("head",))
         self.log.configure(state="disabled")
 
@@ -442,9 +443,9 @@ class App(tk.Tk):
         port_frame = ttk.LabelFrame(parent, text="SERIAL PORT  (only needed to download)")
         port_frame.pack(fill="x", **pad)
         self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(port_frame, textvariable=self.port_var, width=42,
+        self.port_combo = ttk.Combobox(port_frame, textvariable=self.port_var, width=30,
                                        state="readonly")
-        self.port_combo.pack(side="left", padx=6, pady=6)
+        self.port_combo.pack(side="left", padx=6, pady=6, fill="x", expand=True)
         refresh_btn = ttk.Button(port_frame, text="⟳ Refresh", command=self._refresh_ports)
         refresh_btn.pack(side="left", padx=6)
         Tooltip(refresh_btn, "Re-scan serial ports. The Raspberry Pi Pico is "
@@ -485,14 +486,14 @@ class App(tk.Tk):
         lbl = ttk.Label(opt_frame, text="Output folder:")
         lbl.grid(row=r, column=0, sticky="w", padx=6, pady=4)
         self.outdir_var = tk.StringVar()
-        outdir_entry = ttk.Entry(opt_frame, textvariable=self.outdir_var, width=46)
+        outdir_entry = ttk.Entry(opt_frame, textvariable=self.outdir_var, width=24)
         outdir_entry.grid(row=r, column=1, columnspan=2, sticky="we", padx=6, pady=4)
         Tooltip(outdir_entry, "Leave blank to use results/<timestamp> next to the tools folder.")
         ttk.Button(opt_frame, text="Browse...", command=self._pick_outdir).grid(
             row=r, column=3, padx=6, pady=4)
 
         actions = ttk.LabelFrame(parent, text="ACTIONS")
-        actions.pack(fill="both", expand=True, **pad)
+        actions.pack(fill="x", **pad)
         self.action_buttons: list[ttk.Button] = []
         rows = (
             ("⬇  Download from stand & analyse", self._act_download, "Accent.TButton",
@@ -509,7 +510,7 @@ class App(tk.Tk):
         )
         for text, cmd, sty, tip in rows:
             b = ttk.Button(actions, text=text, command=cmd, style=sty)
-            b.pack(fill="x", padx=8, pady=5)
+            b.pack(fill="x", padx=8, pady=3)
             Tooltip(b, tip)
             self.action_buttons.append(b)
 
@@ -518,8 +519,8 @@ class App(tk.Tk):
         ttk.Label(
             parent,
             text="These talk to the stand directly over serial. They do not touch "
-                 "the Extract tab's output folder.",
-            style="Mut.TLabel", wraplength=760, justify="left").pack(fill="x", **pad)
+                 "the output folder on the left.",
+            style="Mut.TLabel", wraplength=330, justify="left").pack(fill="x", **pad)
 
         actions = ttk.LabelFrame(parent, text="ACTIONS")
         actions.pack(fill="x", **pad)
@@ -544,7 +545,7 @@ class App(tk.Tk):
         )
         for text, cmd, tip in rows:
             b = ttk.Button(actions, text=text, command=cmd)
-            b.pack(fill="x", padx=8, pady=4)
+            b.pack(fill="x", padx=8, pady=3)
             Tooltip(b, tip)
             self.stand_buttons.append(b)
 
@@ -553,7 +554,7 @@ class App(tk.Tk):
         ttk.Label(note, text=f"Default arming code for the web UI: {DEFAULT_ARM_CODE} "
                             f"(set in firmware/StaticFire_Stand/config.h - change it "
                             f"before a live firing).",
-                 style="Mut.TLabel", wraplength=760, justify="left").pack(anchor="w")
+                 style="Mut.TLabel", wraplength=330, justify="left").pack(anchor="w")
 
         danger = ttk.LabelFrame(parent, text="DANGER ZONE")
         danger.pack(fill="x", **pad)
