@@ -289,6 +289,26 @@ sudo apt install python3-tk        # Debian / Ubuntu
 sudo dnf install python3-tkinter   # Fedora
 ```
 
+### Windows: an icon on the desktop that updates and starts the program
+
+Once, in `cmd`:
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Tomasraketak/Static_Fire_Stand/main/tools/windows/sf_setup.ps1 | iex"
+```
+
+It installs Git and Python 3.12 if they are missing (winget), clones this repository to
+`<Desktop>\Static Fire Stand`, and puts a **Static Fire Stand** icon on the desktop. Every
+double-click on the icon first updates the code to the newest `main`, Python (once a day) and
+the packages, then opens the GUI. Without internet it just starts what is on the disk.
+
+* Safe to run again; a folder that is not a git clone is renamed, never deleted.
+* Local edits to tracked files are put aside with `git stash` before an update, never thrown away.
+  Your measurements (`tools/results`) are not touched: git ignores that folder.
+* A different folder: `set SF_TARGET=D:\Static Fire Stand` before the command.
+* Log of the last start: `%LOCALAPPDATA%\StaticFireStand\launch.log`; a crash of the GUI at
+  start-up is shown in the window and saved in `gui_error.log` next to it.
+
 ---
 
 ## 4. Operating tutorial
