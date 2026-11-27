@@ -130,11 +130,32 @@ static bool     btnLatched    = false; // must be released before it counts agai
 static uint32_t lastLedUpdate = 0;
 static bool     dumping       = false;
 
+// Igniter continuity on this board: an analog level, not a logic one - see
+// CONT_ADC_MIN_MV in config.h. Read at most every CONT_READ_EVERY_MS (one
+// single conversion, a few microseconds) and cached in between, so the
+// per-sample flag and loop() cost nothing extra.
+#if PIN_CONT < 26 || PIN_CONT > 29
+#error "PIN_CONT must be an ADC pin (GP26..GP29): the continuity sense is analog"
+#endif
+static bool     contCached   = false;
+static uint32_t contReadMs   = 0;
+static bool     contEverRead = false;
+static bool contLocal() {
+  uint32_t now = millis();
+  if (!contEverRead || now - contReadMs >= CONT_READ_EVERY_MS) {
+    contEverRead = true;
+    contReadMs = now;
+    uint32_t mv = (uint32_t)analogRead(PIN_CONT) * 3300u / 4095u;
+    contCached = mv >= CONT_ADC_MIN_MV;
+  }
+  return contCached;
+}
+
 // Igniter continuity: this board's input, or - with Ariadna - what Ariadna
 // reports for its own pyro 1 (nothing at all if it is not talking).
 static inline bool contSense() {
   if (ariLink.active()) return ariLink.ariadna_cont(millis()) != 0;
-  return digitalRead(PIN_CONT) == HIGH;
+  return contLocal();
 }
 
 static inline float rawToN(int32_t raw) {
@@ -624,11 +645,16 @@ void setup() {
   pinMode(PIN_IGNITION, OUTPUT);
   digitalWrite(PIN_IGNITION, LOW);
 
+  digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_BUZZER, OUTPUT);
+
   pinMode(PIN_BTN,  INPUT_PULLDOWN);
-  pinMode(PIN_RBF,  INPUT_PULLDOWN);
-  pinMode(PIN_CONT, INPUT_PULLDOWN);
+  // RBF and continuity have external pulldowns on the board (R31, R8) and
+  // are driven through dividers: no internal pull, it would shift the level.
+  pinMode(PIN_RBF,  INPUT);
+  analogReadResolution(12);          // continuity and battery are both ADC
+  pinMode(PIN_CONT, INPUT);
   if (BATT_DIVIDER_RATIO > 0.0f) {
-    analogReadResolution(12);
     pinMode(PIN_BATT_ADC, INPUT);
   }
 

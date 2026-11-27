@@ -177,16 +177,28 @@ been learned, and `i` / `--info` report the measured period. Set
 
 ## 2. Wiring
 
+Matches the PCB7 board (netlist `Netlist_PCB7_2026-11-27`).
+
 | Pico pin | Function | Note |
 |---|---|---|
 | GP2 | HX711 DT | |
 | GP3 | HX711 SCK | |
-| GP6 | FIRE button | to 3V3, `INPUT_PULLDOWN` |
-| GP11 | RBF key | HIGH = inserted = safe |
-| GP21 | MOSFET gate | **10 kΩ pulldown to GND required** |
-| GP22 | SK6812 / WS2812 | status pixel |
-| GP28 | igniter continuity | HIGH = igniter connected |
+| GP6 | FIRE button | to 3V3, 10 kΩ pulldown (R33) |
+| GP10 | buzzer | through 200 Ω to GND; not used by the firmware yet, held LOW |
+| GP11 | RBF sense | HIGH = pyro rail cut = safe (divider from the gate of the P-MOSFET high-side switch) |
+| GP21 | MOSFET gate | **10 kΩ pulldown to GND required** (R10) |
+| GP22 | SK6812 / WS2812 | status pixel, 200 Ω series resistor |
 | GP27 | battery voltage | through a resistive divider, see below |
+| GP28 | igniter continuity | **analog** (ADC2): > 0.5 V = igniter connected, see below |
+| GP16 / 18 / 19 / 17 | micro SD (SPI0 MISO / SCK / MOSI / CS) | wired on the PCB, not used by the firmware |
+| GP4 / GP5 | I2C0 SDA / SCL | the two 4-pin I2C connectors, see Ariadna below |
+
+**Continuity is an analog reading.** The igniter is biased from the battery through
+20 kΩ even while the RBF switch is open, and its low side reaches GP28 through a
+20 kΩ / 10 kΩ divider. With an igniter connected GP28 sits at ~0.33 × VBATT when armed
+and ~0.20 × VBATT when safe (1.3–1.7 V for a 2S pack - not a valid logic HIGH), and at
+~0 V without one, so the firmware reads it with the ADC against `CONT_ADC_MIN_MV`.
+A side effect: continuity is now shown correctly with the RBF key still in, before arming.
 
 Powered from a 2S LiPo.
 
@@ -204,7 +216,9 @@ your thrust curve will be a handful of dots.
 | GP4 | I2C0 SDA | to Ariadna Master `I2C1`/`I2C2` (SDA) |
 | GP5 | I2C0 SCL | to Ariadna Master `I2C1`/`I2C2` (SCL) |
 
-Plus GND. **Not** the 3V3 pins, and no pull-ups on this side. Unused (and untouched) unless you
+Plus GND. **Not** the 3V3 pins, and no pull-ups on this side. The board's I2C
+connectors carry 3V3 on pin 2 (pin 1 GND, 3 SDA, 4 SCL): with a 1:1 cable to Ariadna, cut or
+remove that wire. Unused (and untouched) unless you
 switch the link on with `link ariadna`: with it, **Ariadna fires the igniter** (its pyro 1) and
 copies the record afterwards, while this board keeps running the countdown and recording the thrust.
 Without it the stand is exactly as described everywhere else in this file. Details, protocol and
@@ -212,7 +226,7 @@ safety rules: [docs/ARIADNA_LINK.md](docs/ARIADNA_LINK.md).
 
 ### Battery voltage sense
 
-A simple resistive divider brings the pack voltage down into the RP2040
+A simple resistive divider brings the pack voltage down into the RP2350
 ADC's 0-3.3 V range on GP27:
 
 ```
