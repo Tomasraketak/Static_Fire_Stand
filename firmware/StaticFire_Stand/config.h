@@ -5,16 +5,38 @@
 #pragma once
 
 // ---------------------------------------------------------------------
-//  PIN MAP  (Raspberry Pi Pico 2 W)
+//  PIN MAP  (Raspberry Pi Pico 2 W)  -  matches PCB7 (netlist 2026-11-27)
 // ---------------------------------------------------------------------
-#define PIN_HX711_DT   2    // HX711 DOUT
-#define PIN_HX711_SCK  3    // HX711 PD_SCK
-#define PIN_BTN        6    // physical FIRE button, active HIGH, INPUT_PULLDOWN
-#define PIN_RBF       11    // Remove-Before-Flight key, HIGH = key inserted = SAFE
-#define PIN_IGNITION  21    // gate of the ignition MOSFET (needs 10k gate pulldown!)
-#define PIN_LED       22    // SK6812 / WS2812 status pixel
-#define PIN_CONT      28    // igniter continuity sense, HIGH = igniter present
+#define PIN_HX711_DT   2    // HX711 DOUT   (U1.9)
+#define PIN_HX711_SCK  3    // HX711 PD_SCK (U1.8)
+#define PIN_BTN        6    // physical FIRE button (BC1) to 3V3, 10k pulldown R33, active HIGH
+#define PIN_BUZZER    10    // BUZZER1 via 200R to GND - not used yet, held LOW
+#define PIN_RBF       11    // RBF switch sense, HIGH = pyro supply cut = SAFE (see below)
+#define PIN_IGNITION  21    // gate of the ignition MOSFET Q2 (10k gate pulldown R10)
+#define PIN_LED       22    // SK6812 / WS2812 status pixel (RGB1, 200R series R24)
 #define PIN_BATT_ADC  27    // battery voltage sense, through the divider below (ADC1)
+#define PIN_CONT      28    // igniter continuity sense - read with the ADC (ADC2), see below
+
+// RBF (PCB7): the RBF switch pulls the gate of the P-MOSFET high side
+// switch Q4 to GND - closed = pyro rail (ARM+) live. GP11 senses that gate
+// through a 10k/10k divider (R32/R31): ~0.33 x VBATT = HIGH while the gate
+// is held at VBATT by R14 (switch open, SAFE), 0 V when the switch is
+// closed (ARMED). The board has its own pulldown (R31), so the pin is a
+// plain INPUT - the internal pulldown in parallel would drag a low pack
+// (6.6 V) below the RP2350's 2.0 V input-high threshold.
+//
+// CONTINUITY (PCB7): PYRO- (Q2 drain) -> 20k (R9) -> GP28 -> 10k (R8) -> GND.
+// The igniter is fed from ARM+, which with the RBF switch open is still
+// biased from VBATT through 20k (R15). So with an igniter connected GP28
+// sits at ~0.33 x VBATT when armed and ~0.20 x VBATT when safe
+// (1.3-1.7 V for a 2S pack - NOT a valid digital HIGH), and ~0 V without
+// one. It is therefore read with the ADC and compared against this:
+#define CONT_ADC_MIN_MV      500   // GP28 above this = igniter connected
+#define CONT_READ_EVERY_MS    10   // ADC read rate of the continuity sense
+
+// Not used by the firmware, wired on PCB7 for later:
+//   micro SD (CARD1, SPI0): GP16 MISO, GP18 SCK, GP19 MOSI, GP17 CS
+//   I2C connectors I2C2 / I2C3: GP4 SDA, GP5 SCL (= the Ariadna link below)
 
 // ---------------------------------------------------------------------
 //  ARIADNA LINK (optional)
@@ -124,7 +146,7 @@
 // ---------------------------------------------------------------------
 //  BATTERY VOLTAGE
 //  A resistive divider from the battery (2S LiPo, ~6-8.4 V) brings the
-//  pack voltage down into the RP2040 ADC's 0-3.3 V range on PIN_BATT_ADC:
+//  pack voltage down into the RP2350 ADC's 0-3.3 V range on PIN_BATT_ADC:
 //
 //      VBATT --[ R_TOP ]--+--[ R_BOTTOM ]-- GND
 //                          |
